@@ -852,6 +852,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) element_transform: TransformationMatrix,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
@@ -1277,6 +1278,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: TransformationMatrix::unit(),
             requested_autoscroll: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2542,6 +2544,24 @@ impl Window {
         result
     }
 
+    pub(crate) fn with_element_transform<R>(
+        &mut self,
+        transform: Option<TransformationMatrix>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let Some(transform) = transform else {
+            return f(self);
+        };
+
+        let previous = self.element_transform;
+        self.element_transform = previous.compose(transform);
+        let result = f(self);
+        self.element_transform = previous;
+        result
+    }
+
     /// Perform prepaint on child elements in a "retryable" manner, so that any side effects
     /// of prepaints can be discarded before prepainting again. This is used to support autoscroll
     /// where we need to prepaint children to detect the autoscroll bounds, then adjust the
@@ -2639,6 +2659,11 @@ impl Window {
     pub(crate) fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
+    }
+
+    pub(crate) fn element_transform(&self) -> TransformationMatrix {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        self.element_transform
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -2906,6 +2931,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let element_transform = self.element_transform();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
@@ -2915,6 +2941,7 @@ impl Window {
                 content_mask: content_mask.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
+                transformation: element_transform,
             });
         }
     }
@@ -2934,6 +2961,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let element_transform = self.element_transform();
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
             bounds: quad.bounds.scale(scale_factor),
@@ -2943,6 +2971,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
+            transformation: element_transform,
         });
     }
 
@@ -3078,6 +3107,7 @@ impl Window {
                 size: tile.bounds.size.map(Into::into),
             };
             let content_mask = self.content_mask().scale(scale_factor);
+            let element_transform = self.element_transform();
             self.next_frame.scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 pad: 0,
@@ -3085,7 +3115,7 @@ impl Window {
                 content_mask,
                 color: color.opacity(element_opacity),
                 tile,
-                transformation: TransformationMatrix::unit(),
+                transformation: element_transform,
             });
         }
         Ok(())
@@ -3137,6 +3167,7 @@ impl Window {
             let content_mask = self.content_mask().scale(scale_factor);
             let opacity = self.element_opacity();
 
+            let element_transform = self.element_transform();
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
@@ -3146,6 +3177,7 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
+                transformation: element_transform,
             });
         }
         Ok(())
@@ -3201,6 +3233,7 @@ impl Window {
                 .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
 
+        let element_transform = self.element_transform();
         self.next_frame.scene.insert_primitive(MonochromeSprite {
             order: 0,
             pad: 0,
@@ -3210,7 +3243,7 @@ impl Window {
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation,
+            transformation: element_transform.compose(transformation),
         });
 
         Ok(())
@@ -3253,6 +3286,7 @@ impl Window {
         let corner_radii = corner_radii.scale(scale_factor);
         let opacity = self.element_opacity();
 
+        let element_transform = self.element_transform();
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
             pad: 0,
@@ -3264,6 +3298,7 @@ impl Window {
             corner_radii,
             tile,
             opacity,
+            transformation: element_transform,
         });
         Ok(())
     }

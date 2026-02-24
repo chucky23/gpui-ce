@@ -1865,6 +1865,25 @@ impl Interactivity {
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
+                    let rotation_transform = style.rotation.map(|angle| {
+                        let center = bounds.center();
+                        let sf = window.scale_factor();
+                        let cx_val = center.x.0 * sf;
+                        let cy_val = center.y.0 * sf;
+                        let center_scaled = crate::point(
+                            crate::ScaledPixels(cx_val),
+                            crate::ScaledPixels(cy_val),
+                        );
+                        let neg_center = crate::point(
+                            crate::ScaledPixels(-cx_val),
+                            crate::ScaledPixels(-cy_val),
+                        );
+                        crate::TransformationMatrix::unit()
+                            .translate(center_scaled)
+                            .rotate(angle)
+                            .translate(neg_center)
+                    });
+                    window.with_element_transform(rotation_transform, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
@@ -1926,6 +1945,7 @@ impl Interactivity {
                                 },
                             );
                         });
+                    });
                     });
                 });
 

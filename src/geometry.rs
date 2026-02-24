@@ -2485,6 +2485,7 @@ impl From<Pixels> for Corners<Pixels> {
     Serialize,
     Deserialize,
     Debug,
+    JsonSchema,
 )]
 #[repr(transparent)]
 pub struct Radians(pub f32);
