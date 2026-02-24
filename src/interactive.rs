@@ -405,6 +405,39 @@ impl Deref for ScrollWheelEvent {
     }
 }
 
+/// A magnification (pinch-to-zoom) gesture event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct MagnifyEvent {
+    /// The position of the gesture center on the window.
+    pub position: Point<Pixels>,
+
+    /// The magnification factor. Positive values indicate zoom in, negative values zoom out.
+    /// Typically in the range -1.0..+1.0 per event.
+    pub magnification: f32,
+
+    /// The modifiers that were held down during the gesture.
+    pub modifiers: Modifiers,
+
+    /// The phase of the touch gesture.
+    pub touch_phase: TouchPhase,
+}
+
+impl Sealed for MagnifyEvent {}
+impl InputEvent for MagnifyEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::Magnify(self)
+    }
+}
+impl MouseEvent for MagnifyEvent {}
+
+impl Deref for MagnifyEvent {
+    type Target = Modifiers;
+
+    fn deref(&self) -> &Self::Target {
+        &self.modifiers
+    }
+}
+
 /// The scroll delta for a scroll wheel event.
 #[derive(Clone, Copy, Debug)]
 pub enum ScrollDelta {
@@ -577,6 +610,8 @@ pub enum PlatformInput {
     MouseExited(MouseExitEvent),
     /// The scroll wheel was used.
     ScrollWheel(ScrollWheelEvent),
+    /// A magnification (pinch-to-zoom) gesture was performed.
+    Magnify(MagnifyEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
 }
@@ -592,6 +627,7 @@ impl PlatformInput {
             PlatformInput::MouseMove(event) => Some(event),
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
+            PlatformInput::Magnify(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
         }
     }
@@ -606,6 +642,7 @@ impl PlatformInput {
             PlatformInput::MouseMove(_) => None,
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
+            PlatformInput::Magnify(_) => None,
             PlatformInput::FileDrop(_) => None,
         }
     }
