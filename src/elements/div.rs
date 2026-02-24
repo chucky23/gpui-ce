@@ -331,7 +331,7 @@ impl Interactivity {
     ) {
         self.magnify_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     (listener)(event, window, cx);
                 }
             }));
