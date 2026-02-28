@@ -1865,25 +1865,53 @@ impl Interactivity {
                 }
 
                 window.with_element_opacity(style.opacity, |window| {
-                    let rotation_transform = style.rotation.map(|angle| {
-                        let center = bounds.center();
-                        let sf = window.scale_factor();
-                        let cx_val = center.x.0 * sf;
-                        let cy_val = center.y.0 * sf;
-                        let center_scaled = crate::point(
-                            crate::ScaledPixels(cx_val),
-                            crate::ScaledPixels(cy_val),
-                        );
-                        let neg_center = crate::point(
-                            crate::ScaledPixels(-cx_val),
-                            crate::ScaledPixels(-cy_val),
-                        );
-                        crate::TransformationMatrix::unit()
-                            .translate(center_scaled)
-                            .rotate(angle)
-                            .translate(neg_center)
-                    });
-                    window.with_element_transform(rotation_transform, |window| {
+                    let element_transform = {
+                        let has_scale = style.scale.is_some_and(|s| (s - 1.0).abs() > f32::EPSILON);
+                        let has_rotation = style.rotation.is_some();
+                        if has_scale || has_rotation {
+                            let sf = window.scale_factor();
+                            let mut m = crate::TransformationMatrix::unit();
+                            // Scale от top-left (origin-based)
+                            if let Some(s) = style.scale.filter(|s| (*s - 1.0).abs() > f32::EPSILON) {
+                                let origin = crate::point(
+                                    crate::ScaledPixels(bounds.origin.x.0 * sf),
+                                    crate::ScaledPixels(bounds.origin.y.0 * sf),
+                                );
+                                let neg_origin = crate::point(
+                                    crate::ScaledPixels(-bounds.origin.x.0 * sf),
+                                    crate::ScaledPixels(-bounds.origin.y.0 * sf),
+                                );
+                                m = m.translate(origin)
+                                    .scale(crate::Size { width: s, height: s })
+                                    .translate(neg_origin);
+                            }
+                            // Rotation вокруг визуального центра (с учётом scale)
+                            if let Some(angle) = style.rotation {
+                                let visual_scale = style.scale.unwrap_or(1.0);
+                                let center = bounds.center();
+                                let cx_val = center.x.0 * sf;
+                                let cy_val = center.y.0 * sf;
+                                // При scale от top-left визуальный центр смещается
+                                let visual_cx = bounds.origin.x.0 * sf + (cx_val - bounds.origin.x.0 * sf) * visual_scale;
+                                let visual_cy = bounds.origin.y.0 * sf + (cy_val - bounds.origin.y.0 * sf) * visual_scale;
+                                let center_scaled = crate::point(
+                                    crate::ScaledPixels(visual_cx),
+                                    crate::ScaledPixels(visual_cy),
+                                );
+                                let neg_center = crate::point(
+                                    crate::ScaledPixels(-visual_cx),
+                                    crate::ScaledPixels(-visual_cy),
+                                );
+                                m = m.translate(center_scaled)
+                                    .rotate(angle)
+                                    .translate(neg_center);
+                            }
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    };
+                    window.with_element_transform(element_transform, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(

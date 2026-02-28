@@ -679,6 +679,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the uniform scale factor of this element.
+    ///
+    /// Scale is applied from the top-left corner (origin-based).
+    /// A value of 1.0 means no scaling.
+    fn scale(mut self, factor: f32) -> Self {
+        self.style().scale = Some(factor);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(cols);

@@ -263,6 +263,9 @@ pub struct Style {
     /// The rotation angle of this element in radians
     pub rotation: Option<Radians>,
 
+    /// The uniform scale factor of this element (1.0 = no scaling)
+    pub scale: Option<f32>,
+
     /// The grid columns of this element
     /// Equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<u16>,
@@ -786,6 +789,7 @@ impl Default for Style {
             mouse_cursor: None,
             opacity: None,
             rotation: None,
+            scale: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
