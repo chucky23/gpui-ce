@@ -471,11 +471,21 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        if !scene.raster_tile_updates.is_empty() {
+        {
+            const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+            let required = required_instance_buffer_size(scene);
             let mut pool = self.instance_buffer_pool.lock();
-            const RASTER_FILL_INSTANCE_BUFFER_FLOOR: usize = 32 * 1024 * 1024;
-            if pool.buffer_size < RASTER_FILL_INSTANCE_BUFFER_FLOOR {
-                pool.reset(RASTER_FILL_INSTANCE_BUFFER_FLOOR);
+            if pool.buffer_size < required {
+                let target = required
+                    .checked_next_power_of_two()
+                    .unwrap_or(MAX_INSTANCE_BUFFER_SIZE)
+                    .min(MAX_INSTANCE_BUFFER_SIZE);
+                pool.reset(target);
+                log::info!(
+                    "pre-sized instance buffer to {} bytes for a {} byte scene",
+                    target,
+                    required
+                );
             }
         }
         let layer = self.layer.clone();
@@ -1735,6 +1745,70 @@ fn build_path_rasterization_pipeline_state(
     device
         .new_render_pipeline_state(&descriptor)
         .expect("could not create render pipeline state")
+}
+
+fn required_instance_buffer_size(scene: &Scene) -> usize {
+    fn reserve(offset: &mut usize, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        align_offset(offset);
+        *offset = offset.saturating_add(bytes);
+    }
+
+    fn visit(scene: &Scene, offset: &mut usize) {
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Shadows(values) => reserve(offset, mem::size_of_val(values)),
+                PrimitiveBatch::Quads(values) => reserve(offset, mem::size_of_val(values)),
+                PrimitiveBatch::Paths(paths) => {
+                    let vertex_count = paths
+                        .iter()
+                        .map(|path| path.vertices.len())
+                        .fold(0usize, usize::saturating_add);
+                    reserve(
+                        offset,
+                        vertex_count.saturating_mul(mem::size_of::<PathRasterizationVertex>()),
+                    );
+                    let sprite_count = paths.first().map_or(0, |first| {
+                        if paths.last().is_some_and(|last| last.order == first.order) {
+                            paths.len()
+                        } else {
+                            1
+                        }
+                    });
+                    reserve(
+                        offset,
+                        sprite_count.saturating_mul(mem::size_of::<PathSprite>()),
+                    );
+                }
+                PrimitiveBatch::Underlines(values) => reserve(offset, mem::size_of_val(values)),
+                PrimitiveBatch::MonochromeSprites { sprites, .. } => {
+                    reserve(offset, mem::size_of_val(sprites));
+                }
+                PrimitiveBatch::PolychromeSprites { sprites, .. } => {
+                    reserve(offset, mem::size_of_val(sprites));
+                }
+                PrimitiveBatch::Surfaces(values) => {
+                    for _ in values {
+                        reserve(offset, mem::size_of::<Surface>());
+                    }
+                }
+                PrimitiveBatch::RasterTiles(values) => {
+                    for _ in values {
+                        reserve(offset, mem::size_of::<RasterTileBounds>());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut required = 0usize;
+    for update in &scene.raster_tile_updates {
+        visit(&update.scene, &mut required);
+    }
+    visit(scene, &mut required);
+    required
 }
 
 // Align to multiples of 256 make Metal happy.
