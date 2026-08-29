@@ -449,6 +449,13 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
+        if !scene.raster_tile_updates.is_empty() {
+            let mut pool = self.instance_buffer_pool.lock();
+            const RASTER_FILL_INSTANCE_BUFFER_FLOOR: usize = 32 * 1024 * 1024;
+            if pool.buffer_size < RASTER_FILL_INSTANCE_BUFFER_FLOOR {
+                pool.reset(RASTER_FILL_INSTANCE_BUFFER_FLOOR);
+            }
+        }
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -562,6 +569,12 @@ impl MetalRenderer {
             .collect::<HashSet<_>>();
         for update in &scene.raster_tile_updates {
             let Some(texture) = self.prepare_raster_texture(update, &protected) else {
+                log::error!(
+                    "raster tile allocation skipped: cache={} key={} revision={}",
+                    update.cache.id(),
+                    update.key.value(),
+                    update.revision.value()
+                );
                 continue;
             };
             let gutter = ScaledPixels(update.gutter.0 as f32);
