@@ -595,6 +595,32 @@ impl MetalRenderer {
                 0.,
             )?;
         }
+        let cache_limits = scene
+            .raster_tile_updates
+            .iter()
+            .map(|update| (update.cache.id(), update.config.soft_limit_bytes()))
+            .collect::<HashMap<_, _>>();
+        for (cache_id, soft_limit) in cache_limits {
+            while self
+                .raster_namespaces
+                .get(&cache_id)
+                .is_some_and(|namespace| namespace.stats.resident_bytes > soft_limit)
+            {
+                let candidate = self
+                    .raster_textures
+                    .iter()
+                    .filter(|((candidate_cache, candidate_key), _)| {
+                        *candidate_cache == cache_id
+                            && !protected.contains(&(*candidate_cache, *candidate_key))
+                    })
+                    .min_by_key(|(_, texture)| texture.last_used_frame)
+                    .map(|(key, _)| *key);
+                let Some(candidate) = candidate else {
+                    break;
+                };
+                self.remove_raster_texture(candidate, true);
+            }
+        }
 
         self.encode_scene(
             scene,
