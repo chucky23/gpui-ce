@@ -861,6 +861,11 @@ struct RasterTileVertexOutput {
   float clip_distance [[clip_distance]][4];
 };
 
+struct RasterTileFragmentInput {
+  float4 position [[position]];
+  float2 texture_coords;
+};
+
 vertex RasterTileVertexOutput raster_tile_vertex(
   uint unit_vertex_id [[vertex_id]],
   constant float2 *unit_vertices [[buffer(RasterTileInputIndex_Vertices)]],
@@ -886,7 +891,7 @@ vertex RasterTileVertexOutput raster_tile_vertex(
 }
 
 fragment float4 raster_tile_fragment(
-  RasterTileVertexOutput input [[stage_in]],
+  RasterTileFragmentInput input [[stage_in]],
   texture2d<float> tile_texture [[texture(RasterTileInputIndex_Texture)]]
 ) {
   constexpr sampler tile_sampler(

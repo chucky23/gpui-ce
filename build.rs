@@ -145,6 +145,9 @@ mod macos {
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "Viewport".into(),
+            "RasterTileInputIndex".into(),
+            "RasterTileBounds".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;
