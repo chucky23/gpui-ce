@@ -192,11 +192,17 @@ impl Element for RasterizeTile {
         cx: &mut App,
     ) {
         let mut parent_scene = mem::take(&mut window.next_frame.scene);
-        self.child.as_mut().unwrap().paint(window, cx);
+        let scale_factor = window.scale_factor();
+        let capture_bounds = bounds.dilate(crate::px(self.gutter.0 as f32 / scale_factor));
+        window.with_content_mask(
+            Some(ContentMask {
+                bounds: capture_bounds,
+            }),
+            |window| self.child.as_mut().unwrap().paint(window, cx),
+        );
         let mut tile_scene = mem::replace(&mut window.next_frame.scene, parent_scene);
         tile_scene.finish();
 
-        let scale_factor = window.scale_factor();
         let scaled_bounds = bounds.scale(scale_factor);
         let cache = self.miss.cache.clone();
         window
