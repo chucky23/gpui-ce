@@ -10,7 +10,8 @@ use crate::{
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
     MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    PromptLevel, Quad, RasterCacheHandle, RasterCacheStats, RasterTileKey, RasterTileLookup,
+    RasterTileRevision, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubscriberSet,
     Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
@@ -1892,6 +1893,27 @@ impl Window {
     /// be rendered as two pixels on screen.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
+    }
+
+    /// Looks up an exact raster tile revision in the active platform renderer.
+    pub fn raster_tile_lookup(
+        &self,
+        cache: &RasterCacheHandle,
+        key: RasterTileKey,
+        revision: RasterTileRevision,
+    ) -> RasterTileLookup {
+        self.platform_window
+            .raster_tile_lookup(cache, key, revision)
+    }
+
+    /// Returns renderer-owned resource counters for one raster cache.
+    pub fn raster_cache_stats(&self, cache: &RasterCacheHandle) -> RasterCacheStats {
+        self.platform_window.raster_cache_stats(cache)
+    }
+
+    /// Releases all platform resources associated with one raster cache.
+    pub fn release_raster_cache(&self, cache: &RasterCacheHandle) {
+        self.platform_window.release_raster_cache(cache);
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the

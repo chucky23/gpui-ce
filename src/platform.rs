@@ -39,7 +39,8 @@ use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RealtimePriority, RenderGlyphParams, RenderImage, RenderImageParams,
+    Point, Priority, RasterCacheHandle, RasterCacheStats, RasterTileKey, RasterTileLookup,
+    RasterTileRevision, RealtimePriority, RenderGlyphParams, RenderImage, RenderImageParams,
     RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
     SystemWindowTab, Task, TaskLabel, TaskTiming, ThreadTaskTimings, Window, WindowControlArea,
     hash, point, px, size,
@@ -510,6 +511,21 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    fn raster_tile_lookup(
+        &self,
+        _cache: &RasterCacheHandle,
+        _key: RasterTileKey,
+        _revision: RasterTileRevision,
+    ) -> RasterTileLookup {
+        RasterTileLookup::Unsupported
+    }
+
+    fn raster_cache_stats(&self, _cache: &RasterCacheHandle) -> RasterCacheStats {
+        RasterCacheStats::default()
+    }
+
+    fn release_raster_cache(&self, _cache: &RasterCacheHandle) {}
 
     // macOS specific methods
     fn get_title(&self) -> String {

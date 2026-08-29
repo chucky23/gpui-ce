@@ -33,6 +33,7 @@ pub mod prelude;
 mod profiler;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod queue;
+mod raster_cache;
 mod scene;
 mod shared_string;
 mod shared_uri;
@@ -94,6 +95,7 @@ pub use platform::*;
 pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) use queue::{PriorityQueueReceiver, PriorityQueueSender};
+pub use raster_cache::*;
 pub use refineable::*;
 pub use scene::*;
 pub use shared_string::*;
