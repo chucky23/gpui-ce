@@ -64,8 +64,8 @@ struct CachedRasterTexture {
     last_used_frame: u64,
 }
 
-#[derive(Default)]
 struct RasterNamespace {
+    owner: std::sync::Weak<crate::raster_cache::RasterCacheIdentity>,
     stats: RasterCacheStats,
 }
 
@@ -339,7 +339,14 @@ impl MetalRenderer {
         key: RasterTileKey,
         revision: RasterTileRevision,
     ) -> RasterTileLookup {
-        let namespace = self.raster_namespaces.entry(cache.id()).or_default();
+        self.prune_released_raster_caches();
+        let namespace =
+            self.raster_namespaces
+                .entry(cache.id())
+                .or_insert_with(|| RasterNamespace {
+                    owner: cache.weak_identity(),
+                    stats: RasterCacheStats::default(),
+                });
         if let Some(tile) = self.raster_textures.get_mut(&(cache.id(), key.value()))
             && tile.revision == revision.value()
         {
@@ -368,6 +375,21 @@ impl MetalRenderer {
         self.raster_textures
             .retain(|(cache_id, _), _| *cache_id != cache.id());
         self.raster_namespaces.remove(&cache.id());
+    }
+
+    fn prune_released_raster_caches(&mut self) {
+        let released = self
+            .raster_namespaces
+            .iter()
+            .filter_map(|(cache_id, namespace)| {
+                namespace.owner.upgrade().is_none().then_some(*cache_id)
+            })
+            .collect::<Vec<_>>();
+        for cache_id in released {
+            self.raster_textures
+                .retain(|(texture_cache_id, _), _| *texture_cache_id != cache_id);
+            self.raster_namespaces.remove(&cache_id);
+        }
     }
 
     pub fn take_presented_frame_samples(&self) -> Vec<FramePresentationSample> {
@@ -878,7 +900,13 @@ impl MetalRenderer {
                 last_used_frame: self.frame_index,
             },
         );
-        let namespace = self.raster_namespaces.entry(cache_id).or_default();
+        let namespace = self
+            .raster_namespaces
+            .entry(cache_id)
+            .or_insert_with(|| RasterNamespace {
+                owner: update.cache.weak_identity(),
+                stats: RasterCacheStats::default(),
+            });
         namespace.stats.resident_bytes += bytes;
         namespace.stats.resident_tiles += 1;
         Some(texture)

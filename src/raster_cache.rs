@@ -1,7 +1,7 @@
 //! GPU-resident raster cache contracts.
 
 use std::sync::{
-    Arc,
+    Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -51,7 +51,7 @@ impl Default for RasterCacheConfig {
 }
 
 #[derive(Debug)]
-struct RasterCacheIdentity {
+pub(crate) struct RasterCacheIdentity {
     id: u64,
     config: RasterCacheConfig,
 }
@@ -76,6 +76,10 @@ impl RasterCacheHandle {
 
     pub(crate) fn config(&self) -> RasterCacheConfig {
         self.0.config
+    }
+
+    pub(crate) fn weak_identity(&self) -> Weak<RasterCacheIdentity> {
+        Arc::downgrade(&self.0)
     }
 
     pub(crate) fn tile_hit(
@@ -243,6 +247,17 @@ mod tests {
 
         assert_eq!(first, first_clone);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn weak_cache_identity_expires_after_last_handle_is_dropped() {
+        let handle = RasterCacheHandle::new(RasterCacheConfig::default());
+        let weak = handle.weak_identity();
+        let clone = handle.clone();
+        drop(handle);
+        assert!(weak.upgrade().is_some());
+        drop(clone);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
