@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 /// Default point at which least-recently-used tiles begin to be evicted.
 pub const DEFAULT_RASTER_CACHE_SOFT_LIMIT_BYTES: usize = 224 * 1024 * 1024;
@@ -191,9 +192,35 @@ pub struct RasterCacheStats {
     pub misses: u64,
 }
 
+/// Timing reported for a frame after its drawable was actually presented.
+#[derive(Clone, Copy, Debug)]
+pub struct FramePresentationSample {
+    /// Renderer-assigned monotonic frame identifier.
+    pub frame_id: u64,
+    /// Identifier assigned by `CAMetalDrawable`.
+    pub drawable_id: u64,
+    /// Host timestamp reported by the drawable presentation callback.
+    pub presented_time_seconds: f64,
+    /// CPU instant at which the command buffer was submitted.
+    pub submitted_at: Instant,
+    /// CPU instant at which Metal reported presentation.
+    pub observed_at: Instant,
+    /// GPU execution duration reported by the command buffer, when available.
+    pub gpu_duration: Option<Duration>,
+}
+
+impl FramePresentationSample {
+    /// Wall-clock latency from command submission until the presentation callback.
+    pub fn submission_to_presentation(self) -> Duration {
+        self.observed_at
+            .saturating_duration_since(self.submitted_at)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn cache_config_rejects_invalid_limits() {
@@ -216,5 +243,24 @@ mod tests {
 
         assert_eq!(first, first_clone);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn presentation_sample_reports_submission_latency() {
+        let submitted_at = Instant::now();
+        let observed_at = submitted_at + Duration::from_millis(7);
+        let sample = FramePresentationSample {
+            frame_id: 1,
+            drawable_id: 2,
+            presented_time_seconds: 3.,
+            submitted_at,
+            observed_at,
+            gpu_duration: Some(Duration::from_millis(4)),
+        };
+
+        assert_eq!(
+            sample.submission_to_presentation(),
+            Duration::from_millis(7)
+        );
     }
 }

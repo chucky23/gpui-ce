@@ -1,9 +1,9 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, RasterCacheHandle, RasterCacheStats,
-    RasterTile, RasterTileKey, RasterTileLookup, RasterTileRevision, ScaledPixels, Scene, Shadow,
-    Size, Surface, Underline, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, FramePresentationSample,
+    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    RasterCacheHandle, RasterCacheStats, RasterTile, RasterTileKey, RasterTileLookup,
+    RasterTileRevision, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -32,6 +32,7 @@ use std::{
     ffi::c_void,
     mem, ptr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 // Exported to metal
@@ -148,6 +149,7 @@ pub(crate) struct MetalRenderer {
     raster_textures: HashMap<(u64, u64), CachedRasterTexture>,
     raster_namespaces: HashMap<u64, RasterNamespace>,
     frame_index: u64,
+    presented_frame_samples: Arc<Mutex<Vec<FramePresentationSample>>>,
 }
 
 #[repr(C)]
@@ -327,6 +329,7 @@ impl MetalRenderer {
             raster_textures: HashMap::new(),
             raster_namespaces: HashMap::new(),
             frame_index: 0,
+            presented_frame_samples: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -365,6 +368,10 @@ impl MetalRenderer {
         self.raster_textures
             .retain(|(cache_id, _), _| *cache_id != cache.id());
         self.raster_namespaces.remove(&cache.id());
+    }
+
+    pub fn take_presented_frame_samples(&self) -> Vec<FramePresentationSample> {
+        mem::take(&mut *self.presented_frame_samples.lock())
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -479,6 +486,31 @@ impl MetalRenderer {
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
+
+                    let frame_id = self.frame_index;
+                    let submitted_at = Instant::now();
+                    let samples = self.presented_frame_samples.clone();
+                    let measured_command_buffer = command_buffer.to_owned();
+                    let presented =
+                        ConcreteBlock::new(move |presented_drawable: &metal::DrawableRef| {
+                            let gpu_start: f64 = unsafe {
+                                msg_send![measured_command_buffer.as_ref(), GPUStartTime]
+                            };
+                            let gpu_end: f64 =
+                                unsafe { msg_send![measured_command_buffer.as_ref(), GPUEndTime] };
+                            let gpu_duration = (gpu_start > 0. && gpu_end >= gpu_start)
+                                .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
+                            samples.lock().push(FramePresentationSample {
+                                frame_id,
+                                drawable_id: presented_drawable.drawable_id() as u64,
+                                presented_time_seconds: presented_drawable.presented_time(),
+                                submitted_at,
+                                observed_at: Instant::now(),
+                                gpu_duration,
+                            });
+                        });
+                    let presented = presented.copy();
+                    drawable.add_presented_handler(&presented);
 
                     if self.presents_with_transaction {
                         command_buffer.commit();

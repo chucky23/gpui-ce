@@ -38,12 +38,12 @@ pub(crate) mod scap_screen_capture;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RasterCacheHandle, RasterCacheStats, RasterTileKey, RasterTileLookup,
-    RasterTileRevision, RealtimePriority, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
-    SystemWindowTab, Task, TaskLabel, TaskTiming, ThreadTaskTimings, Window, WindowControlArea,
-    hash, point, px, size,
+    ForegroundExecutor, FramePresentationSample, GlyphId, GpuSpecs, ImageSource, Keymap,
+    LineLayout, Pixels, PlatformInput, Point, Priority, RasterCacheHandle, RasterCacheStats,
+    RasterTileKey, RasterTileLookup, RasterTileRevision, RealtimePriority, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, TaskLabel, TaskTiming, ThreadTaskTimings, Window,
+    WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -526,6 +526,10 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
 
     fn release_raster_cache(&self, _cache: &RasterCacheHandle) {}
+
+    fn take_presented_frame_samples(&self) -> Vec<FramePresentationSample> {
+        Vec::new()
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {

@@ -1502,6 +1502,10 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.release_raster_cache(cache);
     }
 
+    fn take_presented_frame_samples(&self) -> Vec<crate::FramePresentationSample> {
+        self.0.lock().renderer.take_presented_frame_samples()
+    }
+
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
         None
     }

@@ -5,20 +5,20 @@ use crate::{
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
-    FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, RasterCacheHandle, RasterCacheStats, RasterTileKey, RasterTileLookup,
-    RasterTileRevision, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubscriberSet,
-    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextStyle, TextStyleRefinement, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    FileDropEvent, FontId, FramePresentationSample, Global, GlobalElementId, GlyphId, GpuSpecs,
+    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, RasterCacheHandle, RasterCacheStats, RasterTileKey,
+    RasterTileLookup, RasterTileRevision, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -467,6 +467,7 @@ impl<M: Focusable + EventEmitter<DismissEvent> + Render> ManagedView for M {}
 pub struct DismissEvent;
 
 type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
+type PresentedFrameCallback = Box<dyn FnOnce(FramePresentationSample, &mut Window, &mut App)>;
 
 pub(crate) type AnyMouseListener =
     Box<dyn FnMut(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static>;
@@ -863,6 +864,7 @@ pub struct Window {
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
     next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
+    presented_frame_callbacks: Vec<PresentedFrameCallback>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
@@ -1115,8 +1117,8 @@ impl Window {
                 }
 
                 handle
-                    .update(&mut cx, |_, window, _| {
-                        window.complete_frame();
+                    .update(&mut cx, |_, window, cx| {
+                        window.complete_frame(cx);
                     })
                     .log_err();
             }
@@ -1284,6 +1286,7 @@ impl Window {
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
+            presented_frame_callbacks: Vec::new(),
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
@@ -1702,6 +1705,14 @@ impl Window {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
     }
 
+    /// Runs once after Metal confirms that a subsequently submitted frame was presented.
+    pub fn on_next_presented_frame(
+        &mut self,
+        callback: impl FnOnce(FramePresentationSample, &mut Window, &mut App) + 'static,
+    ) {
+        self.presented_frame_callbacks.push(Box::new(callback));
+    }
+
     /// Schedule a frame to be drawn on the next animation frame.
     ///
     /// This is useful for elements that need to animate continuously, such as a video player or an animated GIF.
@@ -2014,8 +2025,16 @@ impl Window {
         self.capslock
     }
 
-    fn complete_frame(&self) {
+    fn complete_frame(&mut self, cx: &mut App) {
         self.platform_window.completed_frame();
+        let samples = self.platform_window.take_presented_frame_samples();
+        for sample in samples {
+            if self.presented_frame_callbacks.is_empty() {
+                break;
+            }
+            let callback = self.presented_frame_callbacks.remove(0);
+            callback(sample, self, cx);
+        }
     }
 
     /// Produces a new frame and assigns it to `rendered_frame`. To actually show
