@@ -9,10 +9,10 @@ float3 linear_to_srgb(float3 color);
 float4 srgb_to_oklab(float4 color);
 float4 oklab_to_srgb(float4 color);
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          constant Size_DevicePixels *viewport_size);
+                          constant Viewport *viewport);
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size);
+                          constant Viewport *viewport);
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
@@ -71,7 +71,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     [[buffer(QuadInputIndex_Vertices)]],
                                     constant Quad *quads
                                     [[buffer(QuadInputIndex_Quads)]],
-                                    constant Size_DevicePixels *viewport_size
+                                    constant Viewport *viewport
                                     [[buffer(QuadInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Quad quad = quads[quad_id];
@@ -79,7 +79,7 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
   float2 local_position = unit_vertex * float2(quad.bounds.size.width, quad.bounds.size.height)
                          + float2(quad.bounds.origin.x, quad.bounds.origin.y);
   float4 device_position =
-      to_device_position_transformed(unit_vertex, quad.bounds, quad.transformation, viewport_size);
+      to_device_position_transformed(unit_vertex, quad.bounds, quad.transformation, viewport);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, quad.bounds,
                                                  quad.content_mask.bounds, quad.transformation);
   float4 border_color = hsla_to_rgba(quad.border_color);
@@ -472,7 +472,7 @@ vertex ShadowVertexOutput shadow_vertex(
     uint unit_vertex_id [[vertex_id]], uint shadow_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(ShadowInputIndex_Vertices)]],
     constant Shadow *shadows [[buffer(ShadowInputIndex_Shadows)]],
-    constant Size_DevicePixels *viewport_size
+    constant Viewport *viewport
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Shadow shadow = shadows[shadow_id];
@@ -490,7 +490,7 @@ vertex ShadowVertexOutput shadow_vertex(
   float2 local_position = unit_vertex * float2(bounds.size.width, bounds.size.height)
                          + float2(bounds.origin.x, bounds.origin.y);
   float4 device_position =
-      to_device_position_transformed(unit_vertex, bounds, shadow.transformation, viewport_size);
+      to_device_position_transformed(unit_vertex, bounds, shadow.transformation, viewport);
   float4 clip_distance =
       distance_from_clip_rect_transformed(unit_vertex, bounds, shadow.content_mask.bounds, shadow.transformation);
   float4 color = hsla_to_rgba(shadow.color);
@@ -572,12 +572,12 @@ vertex UnderlineVertexOutput underline_vertex(
     uint unit_vertex_id [[vertex_id]], uint underline_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(UnderlineInputIndex_Vertices)]],
     constant Underline *underlines [[buffer(UnderlineInputIndex_Underlines)]],
-    constant Size_DevicePixels *viewport_size
+    constant Viewport *viewport
     [[buffer(ShadowInputIndex_ViewportSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Underline underline = underlines[underline_id];
   float4 device_position =
-      to_device_position(unit_vertex, underline.bounds, viewport_size);
+      to_device_position(unit_vertex, underline.bounds, viewport);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, underline.bounds,
                                                  underline.content_mask.bounds);
   float4 color = hsla_to_rgba(underline.color);
@@ -637,14 +637,14 @@ vertex MonochromeSpriteVertexOutput monochrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
     constant MonochromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    constant Size_DevicePixels *viewport_size
+    constant Viewport *viewport
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   MonochromeSprite sprite = sprites[sprite_id];
   float4 device_position =
-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
@@ -692,7 +692,7 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
     uint unit_vertex_id [[vertex_id]], uint sprite_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
     constant PolychromeSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-    constant Size_DevicePixels *viewport_size
+    constant Viewport *viewport
     [[buffer(SpriteInputIndex_ViewportSize)]],
     constant Size_DevicePixels *atlas_size
     [[buffer(SpriteInputIndex_AtlasTextureSize)]]) {
@@ -702,7 +702,7 @@ vertex PolychromeSpriteVertexOutput polychrome_sprite_vertex(
   float2 local_position = unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height)
                          + float2(sprite.bounds.origin.x, sprite.bounds.origin.y);
   float4 device_position =
-      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport_size);
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transformation, viewport);
   float4 clip_distance = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds,
                                                  sprite.content_mask.bounds, sprite.transformation);
   float2 tile_position = to_tile_position(unit_vertex, sprite.tile, atlas_size);
@@ -753,12 +753,13 @@ struct PathRasterizationFragmentInput {
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant Viewport *viewport [[buffer(PathRasterizationInputIndex_ViewportSize)]]
 ) {
   PathRasterizationVertex v = vertices[vertex_id];
-  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
+  float2 vertex_position = float2(v.xy_position.x, v.xy_position.y) -
+    float2(viewport->origin.x, viewport->origin.y);
   float4 position = float4(
-    vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
+    vertex_position * float2(2. / viewport->size.width, -2. / viewport->size.height) + float2(-1., 1.),
     0.,
     1.
   );
@@ -827,17 +828,18 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
   uint sprite_id [[instance_id]],
   constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
   constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]]
+  constant Viewport *viewport [[buffer(SpriteInputIndex_ViewportSize)]]
 ) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PathSprite sprite = sprites[sprite_id];
   // Don't apply content mask because it was already accounted for when
   // rasterizing the path.
   float4 device_position =
-      to_device_position(unit_vertex, sprite.bounds, viewport_size);
+      to_device_position(unit_vertex, sprite.bounds, viewport);
 
   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+  float2 texture_coords = (screen_position - float2(viewport->origin.x, viewport->origin.y)) /
+    float2(viewport->size.width, viewport->size.height);
 
   return PathSpriteVertexOutput{
     device_position,
@@ -851,6 +853,48 @@ fragment float4 path_sprite_fragment(
 ) {
   constexpr sampler intermediate_texture_sampler(mag_filter::linear, min_filter::linear);
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
+}
+
+struct RasterTileVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+  float clip_distance [[clip_distance]][4];
+};
+
+vertex RasterTileVertexOutput raster_tile_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  constant float2 *unit_vertices [[buffer(RasterTileInputIndex_Vertices)]],
+  constant RasterTileBounds *tiles [[buffer(RasterTileInputIndex_Tiles)]],
+  constant Viewport *viewport [[buffer(RasterTileInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  RasterTileBounds tile = tiles[0];
+  float gutter = float(tile.gutter);
+  float2 texture_size = float2(tile.texture_size.width, tile.texture_size.height);
+  float2 core_size = texture_size - float2(2.0 * gutter);
+  float2 texture_coords = (float2(gutter) + unit_vertex * core_size) / texture_size;
+  float4 clip_distance = distance_from_clip_rect(
+    unit_vertex,
+    tile.bounds,
+    tile.content_mask.bounds
+  );
+  return RasterTileVertexOutput{
+    to_device_position(unit_vertex, tile.bounds, viewport),
+    texture_coords,
+    {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}
+  };
+}
+
+fragment float4 raster_tile_fragment(
+  RasterTileVertexOutput input [[stage_in]],
+  texture2d<float> tile_texture [[texture(RasterTileInputIndex_Texture)]]
+) {
+  constexpr sampler tile_sampler(
+    coord::normalized,
+    address::clamp_to_edge,
+    filter::linear
+  );
+  return tile_texture.sample(tile_sampler, input.texture_coords);
 }
 
 struct SurfaceVertexOutput {
@@ -868,14 +912,14 @@ vertex SurfaceVertexOutput surface_vertex(
     uint unit_vertex_id [[vertex_id]], uint surface_id [[instance_id]],
     constant float2 *unit_vertices [[buffer(SurfaceInputIndex_Vertices)]],
     constant SurfaceBounds *surfaces [[buffer(SurfaceInputIndex_Surfaces)]],
-    constant Size_DevicePixels *viewport_size
+    constant Viewport *viewport
     [[buffer(SurfaceInputIndex_ViewportSize)]],
     constant Size_DevicePixels *texture_size
     [[buffer(SurfaceInputIndex_TextureSize)]]) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   SurfaceBounds surface = surfaces[surface_id];
   float4 device_position =
-      to_device_position(unit_vertex, surface.bounds, viewport_size);
+      to_device_position(unit_vertex, surface.bounds, viewport);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
                                                  surface.content_mask.bounds);
   // We are going to copy the whole texture, so the texture position corresponds
@@ -1004,12 +1048,13 @@ float4 oklab_to_srgb(float4 color) {
 }
 
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
-                          constant Size_DevicePixels *input_viewport_size) {
+                          constant Viewport *viewport) {
   float2 position =
       unit_vertex * float2(bounds.size.width, bounds.size.height) +
-      float2(bounds.origin.x, bounds.origin.y);
-  float2 viewport_size = float2((float)input_viewport_size->width,
-                                (float)input_viewport_size->height);
+      float2(bounds.origin.x, bounds.origin.y) -
+      float2(viewport->origin.x, viewport->origin.y);
+  float2 viewport_size = float2((float)viewport->size.width,
+                                (float)viewport->size.height);
   float2 device_position =
       position / viewport_size * float2(2., -2.) + float2(-1., 1.);
   return float4(device_position, 0., 1.);
@@ -1017,7 +1062,7 @@ float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
 
 float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
                           TransformationMatrix transformation,
-                          constant Size_DevicePixels *input_viewport_size) {
+                          constant Viewport *viewport) {
   float2 position =
       unit_vertex * float2(bounds.size.width, bounds.size.height) +
       float2(bounds.origin.x, bounds.origin.y);
@@ -1030,9 +1075,10 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
   // Add in the translation component of the transformation matrix.
   transformed_position[0] += transformation.translation[0];
   transformed_position[1] += transformation.translation[1];
+  transformed_position -= float2(viewport->origin.x, viewport->origin.y);
 
-  float2 viewport_size = float2((float)input_viewport_size->width,
-                                (float)input_viewport_size->height);
+  float2 viewport_size = float2((float)viewport->size.width,
+                                (float)viewport->size.height);
   float2 device_position =
       transformed_position / viewport_size * float2(2., -2.) + float2(-1., 1.);
   return float4(device_position, 0., 1.);

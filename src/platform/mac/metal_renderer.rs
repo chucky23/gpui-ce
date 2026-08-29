@@ -1,8 +1,9 @@
 use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, RasterCacheHandle, RasterCacheStats,
+    RasterTile, RasterTileKey, RasterTileLookup, RasterTileRevision, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
@@ -25,7 +26,13 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    mem, ptr,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = crate::Point<f32>;
@@ -40,6 +47,26 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Viewport {
+    pub size: Size<DevicePixels>,
+    pub origin: Point<ScaledPixels>,
+}
+
+struct CachedRasterTexture {
+    revision: u64,
+    texture: metal::Texture,
+    gutter: u32,
+    bytes: usize,
+    last_used_frame: u64,
+}
+
+#[derive(Default)]
+struct RasterNamespace {
+    stats: RasterCacheStats,
+}
 
 pub unsafe fn new_renderer(
     context: self::Context,
@@ -109,6 +136,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    raster_tiles_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -117,6 +145,9 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    raster_textures: HashMap<(u64, u64), CachedRasterTexture>,
+    raster_namespaces: HashMap<u64, RasterNamespace>,
+    frame_index: u64,
 }
 
 #[repr(C)]
@@ -258,6 +289,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let raster_tiles_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "raster_tiles",
+            "raster_tile_vertex",
+            "raster_tile_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone()));
@@ -277,6 +316,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            raster_tiles_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -284,7 +324,47 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            raster_textures: HashMap::new(),
+            raster_namespaces: HashMap::new(),
+            frame_index: 0,
         }
+    }
+
+    pub fn raster_tile_lookup(
+        &mut self,
+        cache: &RasterCacheHandle,
+        key: RasterTileKey,
+        revision: RasterTileRevision,
+    ) -> RasterTileLookup {
+        let namespace = self.raster_namespaces.entry(cache.id()).or_default();
+        if let Some(tile) = self.raster_textures.get_mut(&(cache.id(), key.value()))
+            && tile.revision == revision.value()
+        {
+            tile.last_used_frame = self.frame_index;
+            namespace.stats.hits += 1;
+            return RasterTileLookup::Hit(cache.tile_hit(
+                key,
+                revision,
+                tile.texture.width() as u32,
+                tile.texture.height() as u32,
+                tile.gutter,
+            ));
+        }
+        namespace.stats.misses += 1;
+        RasterTileLookup::Miss(cache.tile_miss(key, revision))
+    }
+
+    pub fn raster_cache_stats(&self, cache: &RasterCacheHandle) -> RasterCacheStats {
+        self.raster_namespaces
+            .get(&cache.id())
+            .map(|namespace| namespace.stats)
+            .unwrap_or_default()
+    }
+
+    pub fn release_raster_cache(&mut self, cache: &RasterCacheHandle) {
+        self.raster_textures
+            .retain(|(cache_id, _), _| *cache_id != cache.id());
+        self.raster_namespaces.remove(&cache.id());
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -361,12 +441,17 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        self.frame_index = self.frame_index.wrapping_add(1);
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let viewport = Viewport {
+            size: viewport_size,
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+        };
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -381,7 +466,7 @@ impl MetalRenderer {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
 
             let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport);
 
             match command_buffer {
                 Ok(command_buffer) => {
@@ -431,37 +516,96 @@ impl MetalRenderer {
         scene: &Scene,
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
-        let mut command_encoder = new_command_encoder(
+        let protected = scene
+            .raster_tiles
+            .iter()
+            .map(|tile| (tile.cache_id, tile.key))
+            .collect::<HashSet<_>>();
+        for update in &scene.raster_tile_updates {
+            let Some(texture) = self.prepare_raster_texture(update, &protected) else {
+                continue;
+            };
+            let gutter = ScaledPixels(update.gutter.0 as f32);
+            let tile_viewport = Viewport {
+                size: update.texture_size,
+                origin: point(
+                    update.source_bounds.origin.x - gutter,
+                    update.source_bounds.origin.y - gutter,
+                ),
+            };
+            self.encode_scene(
+                &update.scene,
+                &texture,
+                tile_viewport,
+                command_buffer,
+                instance_buffer,
+                &mut instance_offset,
+                0.,
+            )?;
+        }
+
+        self.encode_scene(
+            scene,
+            drawable.texture(),
+            viewport,
             command_buffer,
-            drawable,
-            viewport_size,
-            |color_attachment| {
+            instance_buffer,
+            &mut instance_offset,
+            alpha,
+        )?;
+
+        instance_buffer.metal_buffer.did_modify_range(NSRange {
+            location: 0,
+            length: instance_offset as NSUInteger,
+        });
+        Ok(command_buffer.to_owned())
+    }
+
+    fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        target: &metal::TextureRef,
+        viewport: Viewport,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        let (path_intermediate, path_intermediate_msaa) =
+            self.path_textures_for_viewport(viewport.size);
+
+        let mut command_encoder =
+            new_command_encoder(command_buffer, target, viewport, |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
-            },
-        );
+                color_attachment.set_clear_color(metal::MTLClearColor::new(
+                    0.,
+                    0.,
+                    0.,
+                    clear_alpha,
+                ));
+            });
 
         for batch in scene.batches() {
             let ok = match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
                     shadows,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(
                     quads,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
                 PrimitiveBatch::Paths(paths) => {
@@ -470,27 +614,26 @@ impl MetalRenderer {
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
                         instance_buffer,
-                        &mut instance_offset,
-                        viewport_size,
+                        instance_offset,
+                        viewport,
                         command_buffer,
+                        path_intermediate.as_ref(),
+                        path_intermediate_msaa.as_ref(),
                     );
 
-                    command_encoder = new_command_encoder(
-                        command_buffer,
-                        drawable,
-                        viewport_size,
-                        |color_attachment| {
+                    command_encoder =
+                        new_command_encoder(command_buffer, target, viewport, |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        },
-                    );
+                        });
 
                     if did_draw {
                         self.draw_paths_from_intermediate(
                             paths,
                             instance_buffer,
-                            &mut instance_offset,
-                            viewport_size,
+                            instance_offset,
+                            viewport,
                             command_encoder,
+                            path_intermediate.as_ref(),
                         )
                     } else {
                         false
@@ -499,8 +642,8 @@ impl MetalRenderer {
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
                     underlines,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
                 PrimitiveBatch::MonochromeSprites {
@@ -510,8 +653,8 @@ impl MetalRenderer {
                     texture_id,
                     sprites,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
                 PrimitiveBatch::PolychromeSprites {
@@ -521,15 +664,22 @@ impl MetalRenderer {
                     texture_id,
                     sprites,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
                     surfaces,
                     instance_buffer,
-                    &mut instance_offset,
-                    viewport_size,
+                    instance_offset,
+                    viewport,
+                    command_encoder,
+                ),
+                PrimitiveBatch::RasterTiles(tiles) => self.draw_raster_tiles(
+                    tiles,
+                    instance_buffer,
+                    instance_offset,
+                    viewport,
                     command_encoder,
                 ),
             };
@@ -549,12 +699,132 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
+        Ok(())
+    }
 
-        instance_buffer.metal_buffer.did_modify_range(NSRange {
-            location: 0,
-            length: instance_offset as NSUInteger,
-        });
-        Ok(command_buffer.to_owned())
+    fn path_textures_for_viewport(
+        &self,
+        size: Size<DevicePixels>,
+    ) -> (Option<metal::Texture>, Option<metal::Texture>) {
+        if self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0.max(0) as u64
+                    && texture.height() == size.height.0.max(0) as u64
+            })
+        {
+            return (
+                self.path_intermediate_texture.clone(),
+                self.path_intermediate_msaa_texture.clone(),
+            );
+        }
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            return (None, None);
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let intermediate = self.device.new_texture(&descriptor);
+        let msaa = if self.path_sample_count > 1 {
+            descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+            descriptor.set_sample_count(self.path_sample_count as u64);
+            Some(self.device.new_texture(&descriptor))
+        } else {
+            None
+        };
+        (Some(intermediate), msaa)
+    }
+
+    fn prepare_raster_texture(
+        &mut self,
+        update: &crate::RasterTileUpdate,
+        protected: &HashSet<(u64, u64)>,
+    ) -> Option<metal::Texture> {
+        let cache_id = update.cache.id();
+        let key = update.key.value();
+        let revision = update.revision.value();
+        let texture_key = (cache_id, key);
+        let width = update.texture_size.width.0.max(0) as usize;
+        let height = update.texture_size.height.0.max(0) as usize;
+        let bytes = width.checked_mul(height)?.checked_mul(4)?;
+        if width == 0 || height == 0 || bytes > update.config.hard_limit_bytes() {
+            return None;
+        }
+
+        if let Some(existing) = self.raster_textures.get_mut(&texture_key)
+            && existing.revision == revision
+            && existing.texture.width() as usize == width
+            && existing.texture.height() as usize == height
+        {
+            existing.last_used_frame = self.frame_index;
+            return Some(existing.texture.clone());
+        }
+
+        self.remove_raster_texture(texture_key, false);
+        while self
+            .raster_namespaces
+            .get(&cache_id)
+            .map(|namespace| namespace.stats.resident_bytes + bytes)
+            .unwrap_or(bytes)
+            > update.config.hard_limit_bytes()
+        {
+            let candidate = self
+                .raster_textures
+                .iter()
+                .filter(|((candidate_cache, candidate_key), _)| {
+                    *candidate_cache == cache_id
+                        && !protected.contains(&(*candidate_cache, *candidate_key))
+                })
+                .min_by_key(|(_, texture)| texture.last_used_frame)
+                .map(|(key, _)| *key);
+            let Some(candidate) = candidate else {
+                return None;
+            };
+            self.remove_raster_texture(candidate, true);
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = self.device.new_texture(&descriptor);
+        self.raster_textures.insert(
+            texture_key,
+            CachedRasterTexture {
+                revision,
+                texture: texture.clone(),
+                gutter: update.gutter.0.max(0) as u32,
+                bytes,
+                last_used_frame: self.frame_index,
+            },
+        );
+        let namespace = self.raster_namespaces.entry(cache_id).or_default();
+        namespace.stats.resident_bytes += bytes;
+        namespace.stats.resident_tiles += 1;
+        Some(texture)
+    }
+
+    fn remove_raster_texture(&mut self, key: (u64, u64), evicted: bool) {
+        let Some(texture) = self.raster_textures.remove(&key) else {
+            return;
+        };
+        if let Some(namespace) = self.raster_namespaces.get_mut(&key.0) {
+            namespace.stats.resident_bytes =
+                namespace.stats.resident_bytes.saturating_sub(texture.bytes);
+            namespace.stats.resident_tiles = namespace.stats.resident_tiles.saturating_sub(1);
+            if evicted {
+                namespace.stats.evicted_tiles += 1;
+            }
+        }
     }
 
     fn draw_paths_to_intermediate(
@@ -562,13 +832,15 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_buffer: &metal::CommandBufferRef,
+        intermediate_texture: Option<&metal::Texture>,
+        intermediate_msaa_texture: Option<&metal::Texture>,
     ) -> bool {
         if paths.is_empty() {
             return true;
         }
-        let Some(intermediate_texture) = &self.path_intermediate_texture else {
+        let Some(intermediate_texture) = intermediate_texture else {
             return false;
         };
 
@@ -580,7 +852,7 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = intermediate_msaa_texture {
             color_attachment.set_texture(Some(msaa_texture));
             color_attachment.set_resolve_texture(Some(intermediate_texture));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
@@ -615,8 +887,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -648,7 +920,7 @@ impl MetalRenderer {
         shadows: &[Shadow],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if shadows.is_empty() {
@@ -675,8 +947,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             ShadowInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
 
         let shadow_bytes_len = mem::size_of_val(shadows);
@@ -711,7 +983,7 @@ impl MetalRenderer {
         quads: &[Quad],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if quads.is_empty() {
@@ -738,8 +1010,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             QuadInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
 
         let quad_bytes_len = mem::size_of_val(quads);
@@ -770,14 +1042,15 @@ impl MetalRenderer {
         paths: &[Path<ScaledPixels>],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
+        intermediate_texture: Option<&metal::Texture>,
     ) -> bool {
         let Some(first_path) = paths.first() else {
             return true;
         };
 
-        let Some(ref intermediate_texture) = self.path_intermediate_texture else {
+        let Some(intermediate_texture) = intermediate_texture else {
             return false;
         };
 
@@ -789,8 +1062,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
 
         command_encoder.set_fragment_texture(
@@ -860,7 +1133,7 @@ impl MetalRenderer {
         underlines: &[Underline],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if underlines.is_empty() {
@@ -887,8 +1160,8 @@ impl MetalRenderer {
 
         command_encoder.set_vertex_bytes(
             UnderlineInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
 
         let underline_bytes_len = mem::size_of_val(underlines);
@@ -924,7 +1197,7 @@ impl MetalRenderer {
         sprites: &[MonochromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -959,8 +1232,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -998,7 +1271,7 @@ impl MetalRenderer {
         sprites: &[PolychromeSprite],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if sprites.is_empty() {
@@ -1024,8 +1297,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::AtlasTextureSize as u64,
@@ -1071,7 +1344,7 @@ impl MetalRenderer {
         surfaces: &[PaintSurface],
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
+        viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
@@ -1082,8 +1355,8 @@ impl MetalRenderer {
         );
         command_encoder.set_vertex_bytes(
             SurfaceInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
         );
 
         for surface in surfaces {
@@ -1164,12 +1437,77 @@ impl MetalRenderer {
         }
         true
     }
+
+    fn draw_raster_tiles(
+        &self,
+        tiles: &[RasterTile],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport: Viewport,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        command_encoder.set_render_pipeline_state(&self.raster_tiles_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            RasterTileInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_bytes(
+            RasterTileInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport) as u64,
+            &viewport as *const Viewport as *const _,
+        );
+
+        for tile in tiles {
+            let Some(texture) = self
+                .raster_textures
+                .get(&(tile.cache_id, tile.key))
+                .filter(|entry| entry.revision == tile.revision)
+                .map(|entry| &entry.texture)
+            else {
+                continue;
+            };
+            align_offset(instance_offset);
+            let next_offset = *instance_offset + mem::size_of::<RasterTileBounds>();
+            if next_offset > instance_buffer.size {
+                return false;
+            }
+            unsafe {
+                let destination = (instance_buffer.metal_buffer.contents() as *mut u8)
+                    .add(*instance_offset)
+                    as *mut RasterTileBounds;
+                ptr::write(
+                    destination,
+                    RasterTileBounds {
+                        bounds: tile.bounds,
+                        content_mask: tile.content_mask.clone(),
+                        texture_size: size(
+                            DevicePixels(tile.texture_width as i32),
+                            DevicePixels(tile.texture_height as i32),
+                        ),
+                        gutter: DevicePixels(tile.gutter as i32),
+                        _padding: DevicePixels(0),
+                    },
+                );
+            }
+            command_encoder.set_vertex_buffer(
+                RasterTileInputIndex::Tiles as u64,
+                Some(&instance_buffer.metal_buffer),
+                *instance_offset as u64,
+            );
+            command_encoder
+                .set_fragment_texture(RasterTileInputIndex::Texture as u64, Some(texture));
+            command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+            *instance_offset = next_offset;
+        }
+        true
+    }
 }
 
 fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
-    drawable: &'a metal::MetalDrawableRef,
-    viewport_size: Size<DevicePixels>,
+    target: &'a metal::TextureRef,
+    viewport: Viewport,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
     let render_pass_descriptor = metal::RenderPassDescriptor::new();
@@ -1177,7 +1515,7 @@ fn new_command_encoder<'a>(
         .color_attachments()
         .object_at(0)
         .unwrap();
-    color_attachment.set_texture(Some(drawable.texture()));
+    color_attachment.set_texture(Some(target));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
 
@@ -1185,8 +1523,8 @@ fn new_command_encoder<'a>(
     command_encoder.set_viewport(metal::MTLViewport {
         originX: 0.0,
         originY: 0.0,
-        width: i32::from(viewport_size.width) as f64,
-        height: i32::from(viewport_size.height) as f64,
+        width: i32::from(viewport.size.width) as f64,
+        height: i32::from(viewport.size.height) as f64,
         znear: 0.0,
         zfar: 1.0,
     });
@@ -1351,6 +1689,14 @@ enum PathRasterizationInputIndex {
     ViewportSize = 1,
 }
 
+#[repr(C)]
+enum RasterTileInputIndex {
+    Vertices = 0,
+    Tiles = 1,
+    ViewportSize = 2,
+    Texture = 3,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
@@ -1362,4 +1708,14 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[derive(Clone, Debug)]
+#[repr(C)]
+pub struct RasterTileBounds {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub texture_size: Size<DevicePixels>,
+    pub gutter: DevicePixels,
+    pub _padding: DevicePixels,
 }

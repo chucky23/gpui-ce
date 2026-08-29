@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    Pixels, Point, Radians, RasterCacheConfig, RasterCacheHandle, RasterTileKey,
+    RasterTileRevision, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -32,6 +33,8 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    pub(crate) raster_tiles: Vec<RasterTile>,
+    pub(crate) raster_tile_updates: Vec<RasterTileUpdate>,
 }
 
 impl Scene {
@@ -46,6 +49,8 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.raster_tiles.clear();
+        self.raster_tile_updates.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -109,6 +114,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::RasterTile(tile) => {
+                tile.order = order;
+                self.raster_tiles.push(tile.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -134,6 +143,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.raster_tiles.sort_by_key(|tile| tile.order);
     }
 
     #[cfg_attr(
@@ -166,6 +176,9 @@ impl Scene {
             surfaces: &self.surfaces,
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            raster_tiles: &self.raster_tiles,
+            raster_tiles_start: 0,
+            raster_tiles_iter: self.raster_tiles.iter().peekable(),
         }
     }
 }
@@ -187,6 +200,7 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     PolychromeSprite,
     Surface,
+    RasterTile,
 }
 
 pub(crate) enum PaintOperation {
@@ -204,6 +218,7 @@ pub(crate) enum Primitive {
     MonochromeSprite(MonochromeSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    RasterTile(RasterTile),
 }
 
 impl Primitive {
@@ -216,6 +231,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::RasterTile(tile) => &tile.bounds,
         }
     }
 
@@ -228,6 +244,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::RasterTile(tile) => &tile.content_mask,
         }
     }
 }
@@ -261,6 +278,9 @@ struct BatchIterator<'a> {
     surfaces: &'a [PaintSurface],
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    raster_tiles: &'a [RasterTile],
+    raster_tiles_start: usize,
+    raster_tiles_iter: Peekable<slice::Iter<'a, RasterTile>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -289,6 +309,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.raster_tiles_iter.peek().map(|t| t.order),
+                PrimitiveKind::RasterTile,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -420,6 +444,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                     &self.surfaces[surfaces_start..surfaces_end],
                 ))
             }
+            PrimitiveKind::RasterTile => {
+                let raster_tiles_start = self.raster_tiles_start;
+                let mut raster_tiles_end = raster_tiles_start + 1;
+                self.raster_tiles_iter.next();
+                while self
+                    .raster_tiles_iter
+                    .next_if(|tile| (tile.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    raster_tiles_end += 1;
+                }
+                self.raster_tiles_start = raster_tiles_end;
+                Some(PrimitiveBatch::RasterTiles(
+                    &self.raster_tiles[raster_tiles_start..raster_tiles_end],
+                ))
+            }
         }
     }
 }
@@ -446,6 +486,37 @@ pub(crate) enum PrimitiveBatch<'a> {
         sprites: &'a [PolychromeSprite],
     },
     Surfaces(&'a [PaintSurface]),
+    RasterTiles(&'a [RasterTile]),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RasterTile {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub cache_id: u64,
+    pub key: u64,
+    pub revision: u64,
+    pub texture_width: u32,
+    pub texture_height: u32,
+    pub gutter: u32,
+}
+
+impl From<RasterTile> for Primitive {
+    fn from(tile: RasterTile) -> Self {
+        Primitive::RasterTile(tile)
+    }
+}
+
+pub(crate) struct RasterTileUpdate {
+    pub cache: RasterCacheHandle,
+    pub config: RasterCacheConfig,
+    pub key: RasterTileKey,
+    pub revision: RasterTileRevision,
+    pub texture_size: Size<DevicePixels>,
+    pub gutter: DevicePixels,
+    pub source_bounds: Bounds<ScaledPixels>,
+    pub scene: Scene,
 }
 
 #[derive(Default, Debug, Clone)]

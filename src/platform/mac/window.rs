@@ -1482,6 +1482,26 @@ impl PlatformWindow for MacWindow {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
+    fn raster_tile_lookup(
+        &self,
+        cache: &crate::RasterCacheHandle,
+        key: crate::RasterTileKey,
+        revision: crate::RasterTileRevision,
+    ) -> crate::RasterTileLookup {
+        self.0
+            .lock()
+            .renderer
+            .raster_tile_lookup(cache, key, revision)
+    }
+
+    fn raster_cache_stats(&self, cache: &crate::RasterCacheHandle) -> crate::RasterCacheStats {
+        self.0.lock().renderer.raster_cache_stats(cache)
+    }
+
+    fn release_raster_cache(&self, cache: &crate::RasterCacheHandle) {
+        self.0.lock().renderer.release_raster_cache(cache);
+    }
+
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
         None
     }

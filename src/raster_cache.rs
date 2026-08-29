@@ -76,6 +76,36 @@ impl RasterCacheHandle {
     pub(crate) fn config(&self) -> RasterCacheConfig {
         self.0.config
     }
+
+    pub(crate) fn tile_hit(
+        &self,
+        key: RasterTileKey,
+        revision: RasterTileRevision,
+        texture_width: u32,
+        texture_height: u32,
+        gutter: u32,
+    ) -> RasterTileHit {
+        RasterTileHit {
+            cache: self.clone(),
+            key,
+            revision,
+            texture_width,
+            texture_height,
+            gutter,
+        }
+    }
+
+    pub(crate) fn tile_miss(
+        &self,
+        key: RasterTileKey,
+        revision: RasterTileRevision,
+    ) -> RasterTileMiss {
+        RasterTileMiss {
+            cache: self.clone(),
+            key,
+            revision,
+        }
+    }
 }
 
 impl PartialEq for RasterCacheHandle {
