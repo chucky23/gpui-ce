@@ -27,6 +27,26 @@ pub fn rasterize_tile(
         texture_size,
         gutter,
         child: Some(child.into_any_element()),
+        compose: true,
+    }
+}
+
+/// Paints detailed content into a GPU-resident tile without composing it.
+///
+/// This is intended for application shadow modes that validate cache behavior
+/// while keeping the ordinary detailed scene as the visible authority.
+pub fn rasterize_tile_shadow(
+    miss: RasterTileMiss,
+    texture_size: Size<DevicePixels>,
+    gutter: DevicePixels,
+    child: impl IntoElement,
+) -> RasterizeTile {
+    RasterizeTile {
+        miss,
+        texture_size,
+        gutter,
+        child: Some(child.into_any_element()),
+        compose: false,
     }
 }
 
@@ -116,6 +136,7 @@ pub struct RasterizeTile {
     texture_size: Size<DevicePixels>,
     gutter: DevicePixels,
     child: Option<AnyElement>,
+    compose: bool,
 }
 
 impl IntoElement for RasterizeTile {
@@ -192,18 +213,20 @@ impl Element for RasterizeTile {
                 source_bounds: scaled_bounds,
                 scene: tile_scene,
             });
-        window.next_frame.scene.insert_primitive(RasterTile {
-            order: 0,
-            bounds: scaled_bounds,
-            content_mask: ContentMask {
+        if self.compose {
+            window.next_frame.scene.insert_primitive(RasterTile {
+                order: 0,
                 bounds: scaled_bounds,
-            },
-            cache_id: cache.id(),
-            key: self.miss.key.value(),
-            revision: self.miss.revision.value(),
-            texture_width: self.texture_size.width.0 as u32,
-            texture_height: self.texture_size.height.0 as u32,
-            gutter: self.gutter.0 as u32,
-        });
+                content_mask: ContentMask {
+                    bounds: scaled_bounds,
+                },
+                cache_id: cache.id(),
+                key: self.miss.key.value(),
+                revision: self.miss.revision.value(),
+                texture_width: self.texture_size.width.0 as u32,
+                texture_height: self.texture_size.height.0 as u32,
+                gutter: self.gutter.0 as u32,
+            });
+        }
     }
 }
