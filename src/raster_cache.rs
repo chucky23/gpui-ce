@@ -207,6 +207,8 @@ pub struct FramePresentationSample {
     pub presented_time_seconds: f64,
     /// CPU instant at which the command buffer was submitted.
     pub submitted_at: Instant,
+    /// CPU-clock projection of the drawable's actual host presentation timestamp.
+    pub presented_at: Instant,
     /// CPU instant at which Metal reported presentation.
     pub observed_at: Instant,
     /// GPU execution duration reported by the command buffer, when available.
@@ -214,9 +216,9 @@ pub struct FramePresentationSample {
 }
 
 impl FramePresentationSample {
-    /// Wall-clock latency from command submission until the presentation callback.
+    /// Wall-clock latency from command submission until the drawable was presented.
     pub fn submission_to_presentation(self) -> Duration {
-        self.observed_at
+        self.presented_at
             .saturating_duration_since(self.submitted_at)
     }
 }
@@ -269,6 +271,7 @@ mod tests {
             drawable_id: 2,
             presented_time_seconds: 3.,
             submitted_at,
+            presented_at: observed_at,
             observed_at,
             gpu_duration: Some(Duration::from_millis(4)),
         };
