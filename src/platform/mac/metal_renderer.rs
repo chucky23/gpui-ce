@@ -349,6 +349,11 @@ struct DeferredRender {
     instance_buffer: InstanceBuffer,
 }
 
+enum PreparedRasterBatchTexture {
+    AlreadyReady,
+    Allocated(metal::Texture),
+}
+
 impl InstanceBufferPool {
     pub(crate) fn reset(&mut self, buffer_size: usize) {
         self.buffer_size = buffer_size;
@@ -1124,7 +1129,7 @@ impl MetalRenderer {
             }
 
             let batch_size = size(DevicePixels(batch_width), DevicePixels(batch_height));
-            let Some(batch_texture) =
+            let Some(prepared_batch_texture) =
                 self.prepare_raster_batch_texture(batch, source_bounds, batch_size, &protected)
             else {
                 log::error!(
@@ -1132,6 +1137,10 @@ impl MetalRenderer {
                     batch.cache.id(),
                     batch.targets.len()
                 );
+                continue;
+            };
+            let PreparedRasterBatchTexture::Allocated(batch_texture) = prepared_batch_texture
+            else {
                 continue;
             };
             let batch_viewport = Viewport {
@@ -1680,7 +1689,7 @@ impl MetalRenderer {
         source_bounds: Bounds<ScaledPixels>,
         texture_size: Size<DevicePixels>,
         protected: &HashSet<(u64, u64, u64)>,
-    ) -> Option<metal::Texture> {
+    ) -> Option<PreparedRasterBatchTexture> {
         let cache_id = batch.cache.id();
         let width = texture_size.width.0.max(0) as usize;
         let height = texture_size.height.0.max(0) as usize;
@@ -1702,16 +1711,23 @@ impl MetalRenderer {
             {
                 return None;
             }
+            let texture_key =
+                cached_raster_texture_key(cache_id, target.key.value(), target.revision.value());
+            if let Some(existing) = self.raster_textures.get_mut(&texture_key)
+                && existing.source_size == batch.texture_size
+                && existing.gutter == batch.gutter.0.max(0) as u32
+            {
+                existing.last_used_frame = self.frame_index;
+                continue;
+            }
+            self.remove_raster_texture(texture_key, false);
             entries.push((
                 target,
                 point(DevicePixels(source_x), DevicePixels(source_y)),
             ));
         }
-        for (target, _) in &entries {
-            self.remove_raster_texture(
-                (cache_id, target.key.value(), target.revision.value()),
-                false,
-            );
+        if entries.is_empty() {
+            return Some(PreparedRasterBatchTexture::AlreadyReady);
         }
         while self
             .raster_namespaces
@@ -1753,6 +1769,7 @@ impl MetalRenderer {
             texture: texture.clone(),
             bytes,
         });
+        let resident_tiles = entries.len();
         for (target, source_origin) in entries {
             self.raster_textures.insert(
                 cached_raster_texture_key(cache_id, target.key.value(), target.revision.value()),
@@ -1770,8 +1787,8 @@ impl MetalRenderer {
             .entry(cache_id)
             .or_insert_with(|| RasterNamespace::new(&batch.cache));
         namespace.stats.resident_bytes += bytes;
-        namespace.stats.resident_tiles += batch.targets.len();
-        Some(texture)
+        namespace.stats.resident_tiles += resident_tiles;
+        Some(PreparedRasterBatchTexture::Allocated(texture))
     }
 
     fn remove_raster_texture(&mut self, key: CachedRasterTextureKey, evicted: bool) {
