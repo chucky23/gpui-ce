@@ -226,6 +226,7 @@ fn apply_raster_compositor_transform(
     compositor: &mut RasterCompositorLayer,
     contents_scale: f32,
     samples: &Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
+    flush_transaction: bool,
 ) {
     observe_raster_compositor_presentation(compositor, samples);
     let (revision, current) = compositor.handle.snapshot();
@@ -268,6 +269,12 @@ fn apply_raster_compositor_transform(
         let _: () = msg_send![compositor.layer.as_ref(), setAffineTransform: transform];
         let _: () = msg_send![compositor.layer.as_ref(), setPosition: position];
         let _: () = msg_send![class!(CATransaction), commit];
+        if flush_transaction {
+            // Input-triggered camera transforms must reach the render server before the next
+            // display deadline. A committed transaction may otherwise remain queued until the
+            // following run-loop boundary, adding one avoidable presentation interval.
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
     }
     compositor.last_applied = Some(AppliedRasterCompositorTransform {
         revision,
@@ -770,7 +777,12 @@ impl MetalRenderer {
         let contents_scale: f64 = unsafe { msg_send![self.layer.as_ref(), contentsScale] };
         let samples = self.raster_compositor_presentation_samples.clone();
         for compositor in self.raster_compositor_layers.values_mut() {
-            apply_raster_compositor_transform(compositor, contents_scale.max(1.) as f32, &samples);
+            apply_raster_compositor_transform(
+                compositor,
+                contents_scale.max(1.) as f32,
+                &samples,
+                false,
+            );
         }
     }
 
@@ -780,7 +792,12 @@ impl MetalRenderer {
         let Some(compositor) = self.raster_compositor_layers.get_mut(&compositor_id) else {
             return false;
         };
-        apply_raster_compositor_transform(compositor, contents_scale.max(1.) as f32, &samples);
+        apply_raster_compositor_transform(
+            compositor,
+            contents_scale.max(1.) as f32,
+            &samples,
+            true,
+        );
         true
     }
 
