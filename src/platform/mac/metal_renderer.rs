@@ -10,7 +10,7 @@ use block::ConcreteBlock;
 use cocoa::{
     base::{NO, YES},
     foundation::{NSSize, NSUInteger},
-    quartzcore::AutoresizingMask,
+    quartzcore::{AutoresizingMask, current_media_time},
 };
 
 use core_foundation::base::TCFType;
@@ -31,27 +31,9 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     mem, ptr,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
-
-fn current_host_time_seconds() -> Option<f64> {
-    static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
-    let &(numerator, denominator) = TIMEBASE.get_or_init(|| {
-        let mut timebase = mach2::mach_time::mach_timebase_info_data_t::default();
-        let result = unsafe { mach2::mach_time::mach_timebase_info(&mut timebase) };
-        if result == 0 {
-            (timebase.numer, timebase.denom)
-        } else {
-            (0, 0)
-        }
-    });
-    if denominator == 0 {
-        return None;
-    }
-    let ticks = unsafe { mach2::mach_time::mach_absolute_time() };
-    Some(ticks as f64 * f64::from(numerator) / f64::from(denominator) / 1_000_000_000.0)
-}
 
 // Exported to metal
 pub(crate) type PointF = crate::Point<f32>;
@@ -559,13 +541,11 @@ impl MetalRenderer {
                                 .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
                             let presented_time_seconds = presented_drawable.presented_time();
                             let observed_at = Instant::now();
-                            let callback_delay = current_host_time_seconds()
-                                .filter(|current_host_time| {
-                                    current_host_time.is_finite()
-                                        && presented_time_seconds.is_finite()
-                                        && *current_host_time >= presented_time_seconds
-                                })
-                                .map(|current_host_time| {
+                            let current_host_time = current_media_time();
+                            let callback_delay = (current_host_time.is_finite()
+                                && presented_time_seconds.is_finite()
+                                && current_host_time >= presented_time_seconds)
+                                .then(|| {
                                     Duration::from_secs_f64(
                                         current_host_time - presented_time_seconds,
                                     )
