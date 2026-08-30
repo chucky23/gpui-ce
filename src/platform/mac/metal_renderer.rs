@@ -64,12 +64,21 @@ struct CachedRasterAllocation {
 }
 
 struct CachedRasterTexture {
-    revision: u64,
     allocation: Arc<CachedRasterAllocation>,
     source_origin: Point<DevicePixels>,
     source_size: Size<DevicePixels>,
     gutter: u32,
     last_used_frame: u64,
+}
+
+type CachedRasterTextureKey = (u64, u64, u64);
+
+fn cached_raster_texture_key(
+    cache_id: u64,
+    tile_key: u64,
+    revision: u64,
+) -> CachedRasterTextureKey {
+    (cache_id, tile_key, revision)
 }
 
 struct RasterNamespace {
@@ -388,7 +397,12 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    raster_textures: HashMap<(u64, u64), CachedRasterTexture>,
+    // Keep multiple content revisions for the same logical tile alive. A retained compositor
+    // frame can still reference the previous revision while a deferred command buffer builds
+    // its replacement. Keying only by `(cache, tile)` removed the visible revision before the
+    // replacement was ready and produced transparent strips and mixed frames during hover,
+    // selection, pan and zoom.
+    raster_textures: HashMap<CachedRasterTextureKey, CachedRasterTexture>,
     raster_namespaces: HashMap<u64, RasterNamespace>,
     raster_compositor_layers: HashMap<u64, RasterCompositorLayer>,
     raster_compositor_deferred_renders: Vec<DeferredRender>,
@@ -600,9 +614,11 @@ impl MetalRenderer {
             .raster_namespaces
             .entry(cache.id())
             .or_insert_with(|| RasterNamespace::new(cache));
-        if let Some(tile) = self.raster_textures.get_mut(&(cache.id(), key.value()))
-            && tile.revision == revision.value()
-        {
+        if let Some(tile) = self.raster_textures.get_mut(&cached_raster_texture_key(
+            cache.id(),
+            key.value(),
+            revision.value(),
+        )) {
             tile.last_used_frame = self.frame_index;
             namespace.stats.hits += 1;
             return RasterTileLookup::Hit(cache.tile_hit(key, revision, tile.gutter));
@@ -628,7 +644,7 @@ impl MetalRenderer {
 
     pub fn release_raster_cache(&mut self, cache: &RasterCacheHandle) {
         self.raster_textures
-            .retain(|(cache_id, _), _| *cache_id != cache.id());
+            .retain(|(cache_id, _, _), _| *cache_id != cache.id());
         self.raster_namespaces.remove(&cache.id());
     }
 
@@ -642,7 +658,7 @@ impl MetalRenderer {
             .collect::<Vec<_>>();
         for cache_id in released {
             self.raster_textures
-                .retain(|(texture_cache_id, _), _| *texture_cache_id != cache_id);
+                .retain(|(texture_cache_id, _, _), _| *texture_cache_id != cache_id);
             self.raster_namespaces.remove(&cache_id);
         }
     }
@@ -1015,14 +1031,30 @@ impl MetalRenderer {
         let protected = scene
             .raster_tiles
             .iter()
-            .map(|tile| (tile.cache_id, tile.key))
+            .map(|tile| (tile.cache_id, tile.key, tile.revision))
             .chain(
                 scene
                     .raster_tile_update_batches
                     .iter()
                     .flat_map(|batch| batch.scene.raster_tiles.iter())
-                    .map(|tile| (tile.cache_id, tile.key)),
+                    .map(|tile| (tile.cache_id, tile.key, tile.revision)),
             )
+            .chain(scene.raster_tile_updates.iter().map(|update| {
+                (
+                    update.cache.id(),
+                    update.key.value(),
+                    update.revision.value(),
+                )
+            }))
+            .chain(scene.raster_tile_update_batches.iter().flat_map(|batch| {
+                batch.targets.iter().map(|target| {
+                    (
+                        batch.cache.id(),
+                        target.key.value(),
+                        target.revision.value(),
+                    )
+                })
+            }))
             .collect::<HashSet<_>>();
         for update in &scene.raster_tile_updates {
             let Some(texture) = self.prepare_raster_texture(update, &protected) else {
@@ -1183,10 +1215,16 @@ impl MetalRenderer {
                 let candidate = self
                     .raster_textures
                     .iter()
-                    .filter(|((candidate_cache, candidate_key), _)| {
-                        *candidate_cache == cache_id
-                            && !protected.contains(&(*candidate_cache, *candidate_key))
-                    })
+                    .filter(
+                        |((candidate_cache, candidate_key, candidate_revision), _)| {
+                            *candidate_cache == cache_id
+                                && !protected.contains(&(
+                                    *candidate_cache,
+                                    *candidate_key,
+                                    *candidate_revision,
+                                ))
+                        },
+                    )
                     .min_by_key(|(_, texture)| texture.last_used_frame)
                     .map(|(key, _)| *key);
                 let Some(candidate) = candidate else {
@@ -1534,7 +1572,7 @@ impl MetalRenderer {
     fn prepare_raster_texture(
         &mut self,
         update: &crate::RasterTileUpdate,
-        protected: &HashSet<(u64, u64)>,
+        protected: &HashSet<(u64, u64, u64)>,
     ) -> Option<metal::Texture> {
         self.prepare_raster_texture_fields(
             &update.cache,
@@ -1555,12 +1593,12 @@ impl MetalRenderer {
         tile_revision: RasterTileRevision,
         texture_size: Size<DevicePixels>,
         gutter: DevicePixels,
-        protected: &HashSet<(u64, u64)>,
+        protected: &HashSet<(u64, u64, u64)>,
     ) -> Option<metal::Texture> {
         let cache_id = cache.id();
         let key = tile_key.value();
         let revision = tile_revision.value();
-        let texture_key = (cache_id, key);
+        let texture_key = cached_raster_texture_key(cache_id, key, revision);
         let width = texture_size.width.0.max(0) as usize;
         let height = texture_size.height.0.max(0) as usize;
         let bytes = width.checked_mul(height)?.checked_mul(4)?;
@@ -1569,7 +1607,6 @@ impl MetalRenderer {
         }
 
         if let Some(existing) = self.raster_textures.get_mut(&texture_key)
-            && existing.revision == revision
             && existing.source_size.width.0.max(0) as usize == width
             && existing.source_size.height.0.max(0) as usize == height
         {
@@ -1588,10 +1625,16 @@ impl MetalRenderer {
             let candidate = self
                 .raster_textures
                 .iter()
-                .filter(|((candidate_cache, candidate_key), _)| {
-                    *candidate_cache == cache_id
-                        && !protected.contains(&(*candidate_cache, *candidate_key))
-                })
+                .filter(
+                    |((candidate_cache, candidate_key, candidate_revision), _)| {
+                        *candidate_cache == cache_id
+                            && !protected.contains(&(
+                                *candidate_cache,
+                                *candidate_key,
+                                *candidate_revision,
+                            ))
+                    },
+                )
                 .min_by_key(|(_, texture)| texture.last_used_frame)
                 .map(|(key, _)| *key);
             let Some(candidate) = candidate else {
@@ -1615,8 +1658,7 @@ impl MetalRenderer {
         self.raster_textures.insert(
             texture_key,
             CachedRasterTexture {
-                revision,
-                allocation: allocation.clone(),
+                allocation,
                 source_origin: point(DevicePixels(0), DevicePixels(0)),
                 source_size: texture_size,
                 gutter: gutter.0.max(0) as u32,
@@ -1637,7 +1679,7 @@ impl MetalRenderer {
         batch: &crate::RasterTileUpdateBatch,
         source_bounds: Bounds<ScaledPixels>,
         texture_size: Size<DevicePixels>,
-        protected: &HashSet<(u64, u64)>,
+        protected: &HashSet<(u64, u64, u64)>,
     ) -> Option<metal::Texture> {
         let cache_id = batch.cache.id();
         let width = texture_size.width.0.max(0) as usize;
@@ -1666,7 +1708,10 @@ impl MetalRenderer {
             ));
         }
         for (target, _) in &entries {
-            self.remove_raster_texture((cache_id, target.key.value()), false);
+            self.remove_raster_texture(
+                (cache_id, target.key.value(), target.revision.value()),
+                false,
+            );
         }
         while self
             .raster_namespaces
@@ -1678,10 +1723,16 @@ impl MetalRenderer {
             let candidate = self
                 .raster_textures
                 .iter()
-                .filter(|((candidate_cache, candidate_key), _)| {
-                    *candidate_cache == cache_id
-                        && !protected.contains(&(*candidate_cache, *candidate_key))
-                })
+                .filter(
+                    |((candidate_cache, candidate_key, candidate_revision), _)| {
+                        *candidate_cache == cache_id
+                            && !protected.contains(&(
+                                *candidate_cache,
+                                *candidate_key,
+                                *candidate_revision,
+                            ))
+                    },
+                )
                 .min_by_key(|(_, texture)| texture.last_used_frame)
                 .map(|(key, _)| *key);
             let Some(candidate) = candidate else {
@@ -1704,9 +1755,8 @@ impl MetalRenderer {
         });
         for (target, source_origin) in entries {
             self.raster_textures.insert(
-                (cache_id, target.key.value()),
+                cached_raster_texture_key(cache_id, target.key.value(), target.revision.value()),
                 CachedRasterTexture {
-                    revision: target.revision.value(),
                     allocation: allocation.clone(),
                     source_origin,
                     source_size: batch.texture_size,
@@ -1724,7 +1774,7 @@ impl MetalRenderer {
         Some(texture)
     }
 
-    fn remove_raster_texture(&mut self, key: (u64, u64), evicted: bool) {
+    fn remove_raster_texture(&mut self, key: CachedRasterTextureKey, evicted: bool) {
         let Some(texture) = self.raster_textures.remove(&key) else {
             return;
         };
@@ -2386,11 +2436,11 @@ impl MetalRenderer {
         );
 
         for tile in tiles {
-            let Some(texture) = self
-                .raster_textures
-                .get(&(tile.cache_id, tile.key))
-                .filter(|entry| entry.revision == tile.revision)
-            else {
+            let Some(texture) = self.raster_textures.get(&cached_raster_texture_key(
+                tile.cache_id,
+                tile.key,
+                tile.revision,
+            )) else {
                 continue;
             };
             align_offset(instance_offset);
@@ -2684,6 +2734,17 @@ fn compare_bgra_images(
 #[cfg(test)]
 mod raster_comparison_tests {
     use super::*;
+
+    #[test]
+    fn raster_texture_identity_keeps_content_revisions_distinct() {
+        let visible = cached_raster_texture_key(7, 11, 41);
+        let replacement = cached_raster_texture_key(7, 11, 42);
+
+        assert_ne!(visible, replacement);
+        let protected = HashSet::from([visible, replacement]);
+        assert!(protected.contains(&visible));
+        assert!(protected.contains(&replacement));
+    }
 
     #[test]
     fn identical_images_have_perfect_similarity() {
