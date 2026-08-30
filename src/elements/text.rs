@@ -364,6 +364,7 @@ struct RasterTextPaintCacheEntry {
     scale_factor_bits: u32,
     element_opacity_bits: u32,
     bounds_size: Size<Pixels>,
+    content_mask_bounds: Bounds<ScaledPixels>,
     source_origin: Point<ScaledPixels>,
     operations: Vec<crate::scene::PaintOperation>,
 }
@@ -567,6 +568,7 @@ impl TextLayout {
         let text_style = window.text_style();
         let scale_factor = window.scale_factor();
         let scaled_origin = bounds.origin.scale(scale_factor);
+        let content_mask_bounds = window.content_mask().scale(scale_factor).bounds;
         let element_opacity = window.element_opacity();
         let same_subpixel_phase = |left: Point<ScaledPixels>, right: Point<ScaledPixels>| {
             let phase = |value: ScaledPixels| value.0.rem_euclid(1.0);
@@ -579,6 +581,10 @@ impl TextLayout {
                     && entry.scale_factor_bits == scale_factor.to_bits()
                     && entry.element_opacity_bits == element_opacity.to_bits()
                     && entry.bounds_size == bounds.size
+                    // Layer operations are clipped when they enter a Scene. Replaying an
+                    // operation captured for another tile would therefore carry only the
+                    // first tile's text fragment into the new tile.
+                    && entry.content_mask_bounds == content_mask_bounds
                     && same_subpixel_phase(entry.source_origin, scaled_origin)
             })
         {
@@ -634,6 +640,7 @@ impl TextLayout {
                     scale_factor_bits: scale_factor.to_bits(),
                     element_opacity_bits: element_opacity.to_bits(),
                     bounds_size: bounds.size,
+                    content_mask_bounds,
                     source_origin: scaled_origin,
                     operations,
                 });
