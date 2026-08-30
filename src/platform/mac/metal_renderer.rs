@@ -1223,8 +1223,14 @@ impl MetalRenderer {
         instance_offset: &mut usize,
         clear_alpha: f64,
     ) -> Result<()> {
-        let (path_intermediate, path_intermediate_msaa) =
-            self.path_textures_for_viewport(viewport.size);
+        // A raster resample batch normally contains only cached tile primitives. Allocating a
+        // full-size color target plus a 4× MSAA target for every such deferred command buffer
+        // needlessly multiplies transient GPU memory and delays exact-zoom completion.
+        let (path_intermediate, path_intermediate_msaa) = if scene_needs_path_intermediate(scene) {
+            self.path_textures_for_viewport(viewport.size)
+        } else {
+            (None, None)
+        };
 
         let mut command_encoder =
             new_command_encoder(command_buffer, target, viewport, |color_attachment| {
@@ -2736,6 +2742,17 @@ mod raster_comparison_tests {
     }
 
     #[test]
+    fn path_intermediate_is_reserved_only_for_scenes_with_paths() {
+        let mut scene = Scene::default();
+        assert!(!scene_needs_path_intermediate(&scene));
+
+        scene
+            .paths
+            .push(crate::Path::new(point(crate::px(0.), crate::px(0.))).scale(1.));
+        assert!(scene_needs_path_intermediate(&scene));
+    }
+
+    #[test]
     fn compositor_rejects_transforms_that_expose_uncaptured_pixels() {
         let raster_size = NSSize {
             width: 1_824.,
@@ -2773,6 +2790,10 @@ mod raster_comparison_tests {
             clip_size,
         ));
     }
+}
+
+fn scene_needs_path_intermediate(scene: &Scene) -> bool {
+    !scene.paths.is_empty()
 }
 
 fn required_instance_buffer_size(scene: &Scene) -> usize {
