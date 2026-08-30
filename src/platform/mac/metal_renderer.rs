@@ -186,7 +186,10 @@ impl MetalRenderer {
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_opaque(false);
-        layer.set_maximum_drawable_count(3);
+        // Two drawables bound presentation latency to one queued frame. The previous third
+        // drawable improved throughput only when GPU work approached the refresh budget, while
+        // adding a full frame of latency to interactive surfaces with short GPU workloads.
+        layer.set_maximum_drawable_count(2);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
