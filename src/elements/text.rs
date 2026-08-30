@@ -395,7 +395,7 @@ impl TextLayout {
             .and_then(|measurement| measurement.size)
     }
 
-    /// Replays measured text directly into an offscreen raster scene at `bounds`.
+    /// Paints measured text directly into an offscreen raster scene at `bounds`.
     ///
     /// Returns `false` when the layout has not been measured yet so callers can retain their
     /// ordinary detailed element as a correctness-preserving fallback.
@@ -411,9 +411,10 @@ impl TextLayout {
             return false;
         }
         self.prepaint(bounds, text);
-        window.with_text_style(Some(style), |window| {
-            self.paint(text, true, window, cx);
-        });
+        // A Scene clips layer operations as they are recorded. Reusing those operations in a
+        // neighboring tile can only replay the fragment admitted by the first tile. Measurement
+        // and shaping remain shared; record fresh glyph primitives for each raster target.
+        window.with_text_style(Some(style), |window| self.paint(text, false, window, cx));
         true
     }
 
