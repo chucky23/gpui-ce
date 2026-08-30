@@ -1474,8 +1474,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw(&self, scene: &crate::Scene) {
-        let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        self.0.lock().renderer.draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1504,6 +1503,25 @@ impl PlatformWindow for MacWindow {
 
     fn take_presented_frame_samples(&self) -> Vec<crate::FramePresentationSample> {
         self.0.lock().renderer.take_presented_frame_samples()
+    }
+
+    fn take_raster_compositor_presentation_samples(
+        &self,
+    ) -> Vec<crate::RasterCompositorPresentationSample> {
+        self.0
+            .lock()
+            .renderer
+            .take_raster_compositor_presentation_samples()
+    }
+
+    fn latch_raster_compositor_transform(
+        &self,
+        handle: &crate::RasterCompositorTransformHandle,
+    ) -> bool {
+        self.0
+            .lock()
+            .renderer
+            .latch_raster_compositor_transform(handle.id())
     }
 
     fn gpu_specs(&self) -> Option<crate::GpuSpecs> {
@@ -2200,6 +2218,9 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+
+    #[cfg(not(feature = "macos-blade"))]
+    lock.renderer.update_raster_compositor_transforms();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);

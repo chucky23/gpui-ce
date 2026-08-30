@@ -1,9 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, WhiteSpace, Window, WrappedLine, WrappedLineLayout,
-    register_tooltip_mouse_handlers, set_tooltip_on_window,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScaledPixels, SharedString, Size,
+    TextOverflow, TextRun, TextStyle, TextStyleRefinement, TooltipId, WhiteSpace, Window,
+    WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use smallvec::SmallVec;
@@ -63,7 +63,7 @@ impl Element for &'static str {
         window: &mut Window,
         cx: &mut App,
     ) {
-        text_layout.paint(self, window, cx)
+        text_layout.paint(self, false, window, cx)
     }
 }
 
@@ -129,7 +129,7 @@ impl Element for SharedString {
         window: &mut Window,
         cx: &mut App,
     ) {
-        text_layout.paint(self.as_ref(), window, cx)
+        text_layout.paint(self.as_ref(), false, window, cx)
     }
 }
 
@@ -151,6 +151,7 @@ pub struct StyledText {
     runs: Option<Vec<TextRun>>,
     delayed_highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
     layout: TextLayout,
+    use_cached_raster_paint: bool,
 }
 
 impl StyledText {
@@ -161,12 +162,32 @@ impl StyledText {
             runs: None,
             delayed_highlights: None,
             layout: TextLayout::default(),
+            use_cached_raster_paint: false,
         }
     }
 
     /// Get the layout for this element. This can be used to map indices to pixels and vice versa.
     pub fn layout(&self) -> &TextLayout {
         &self.layout
+    }
+
+    /// Reuses a previously measured layout for identical text and text style.
+    ///
+    /// The caller must invalidate the layout when the font, font size, wrapping width, line
+    /// height, or text changes. Bounds are refreshed during prepaint on every use.
+    pub fn with_layout(mut self, layout: TextLayout) -> Self {
+        self.layout = layout.with_fresh_bounds();
+        self
+    }
+
+    /// Reuses measured layout and prepared glyph primitives for offscreen raster capture.
+    ///
+    /// This skips recording replay operations for cached glyphs and therefore must only be used
+    /// inside content that is rebuilt into an application-owned raster target.
+    pub fn with_raster_layout(mut self, layout: TextLayout) -> Self {
+        self.layout = layout.with_fresh_bounds();
+        self.use_cached_raster_paint = true;
+        self
     }
 
     /// Set the styling attributes for the given text, as well as
@@ -296,7 +317,8 @@ impl Element for StyledText {
         window: &mut Window,
         cx: &mut App,
     ) {
-        self.layout.paint(&self.text, window, cx)
+        self.layout
+            .paint(&self.text, self.use_cached_raster_paint, window, cx)
     }
 }
 
@@ -309,8 +331,22 @@ impl IntoElement for StyledText {
 }
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
-#[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+#[derive(Clone)]
+pub struct TextLayout {
+    measurement: Rc<RefCell<Option<TextLayoutInner>>>,
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    raster_paint_cache: Rc<RefCell<Vec<RasterTextPaintCacheEntry>>>,
+}
+
+impl Default for TextLayout {
+    fn default() -> Self {
+        Self {
+            measurement: Rc::new(RefCell::new(None)),
+            bounds: Rc::new(Cell::new(None)),
+            raster_paint_cache: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+}
 
 struct TextLayoutInner {
     len: usize,
@@ -318,10 +354,68 @@ struct TextLayoutInner {
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
-    bounds: Option<Bounds<Pixels>>,
+    text_style: TextStyle,
+    rem_size: Pixels,
+    runs: Vec<TextRun>,
+}
+
+struct RasterTextPaintCacheEntry {
+    text_style: TextStyle,
+    scale_factor_bits: u32,
+    element_opacity_bits: u32,
+    bounds_size: Size<Pixels>,
+    source_origin: Point<ScaledPixels>,
+    operations: Vec<crate::scene::PaintOperation>,
 }
 
 impl TextLayout {
+    fn with_fresh_bounds(&self) -> Self {
+        Self {
+            measurement: self.measurement.clone(),
+            bounds: Rc::new(Cell::new(None)),
+            raster_paint_cache: self.raster_paint_cache.clone(),
+        }
+    }
+
+    /// Returns a raster-capture copy that shares measurement and glyph operations but owns
+    /// independent placement bounds.
+    ///
+    /// Several offscreen captures may reuse one measured string in the same frame; keeping the
+    /// bounds cell independent prevents their prepaint locations from overwriting each other.
+    pub fn raster_copy(&self) -> Self {
+        self.with_fresh_bounds()
+    }
+
+    /// Returns the measured text size when this layout has completed its first layout pass.
+    pub fn measured_size(&self) -> Option<Size<Pixels>> {
+        self.measurement
+            .borrow()
+            .as_ref()
+            .and_then(|measurement| measurement.size)
+    }
+
+    /// Replays measured text directly into an offscreen raster scene at `bounds`.
+    ///
+    /// Returns `false` when the layout has not been measured yet so callers can retain their
+    /// ordinary detailed element as a correctness-preserving fallback.
+    pub fn paint_raster_at(
+        &self,
+        text: &str,
+        bounds: Bounds<Pixels>,
+        style: TextStyleRefinement,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if self.measurement.borrow().is_none() {
+            return false;
+        }
+        self.prepaint(bounds, text);
+        window.with_text_style(Some(style), |window| {
+            self.paint(text, true, window, cx);
+        });
+        true
+    }
+
     fn layout(
         &self,
         text: SharedString,
@@ -330,7 +424,8 @@ impl TextLayout {
         _: &mut App,
     ) -> LayoutId {
         let text_style = window.text_style();
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let rem_size = window.rem_size();
+        let font_size = text_style.font_size.to_pixels(rem_size);
         let line_height = text_style
             .line_height
             .to_pixels(font_size.into(), window.rem_size());
@@ -370,12 +465,17 @@ impl TextLayout {
                         (None, "".into())
                     };
 
-                if let Some(text_layout) = element_state.0.borrow().as_ref()
+                if let Some(text_layout) = element_state.measurement.borrow().as_ref()
                     && text_layout.size.is_some()
+                    && text_layout.text_style == text_style
+                    && text_layout.rem_size == rem_size
+                    && text_layout.runs == runs
                     && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
                 {
                     return text_layout.size.unwrap();
                 }
+
+                element_state.raster_paint_cache.borrow_mut().clear();
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
@@ -401,14 +501,19 @@ impl TextLayout {
                     )
                     .log_err()
                 else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        size: Some(Size::default()),
-                        bounds: None,
-                    });
+                    element_state
+                        .measurement
+                        .borrow_mut()
+                        .replace(TextLayoutInner {
+                            lines: Default::default(),
+                            len: 0,
+                            line_height,
+                            wrap_width,
+                            size: Some(Size::default()),
+                            text_style: text_style.clone(),
+                            rem_size,
+                            runs: runs.to_vec(),
+                        });
                     return Size::default();
                 };
 
@@ -419,14 +524,19 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                element_state.0.borrow_mut().replace(TextLayoutInner {
-                    lines,
-                    len,
-                    line_height,
-                    wrap_width,
-                    size: Some(size),
-                    bounds: None,
-                });
+                element_state
+                    .measurement
+                    .borrow_mut()
+                    .replace(TextLayoutInner {
+                        lines,
+                        len,
+                        line_height,
+                        wrap_width,
+                        size: Some(size),
+                        text_style: text_style.clone(),
+                        rem_size,
+                        runs: runs.to_vec(),
+                    });
 
                 size
             }
@@ -434,24 +544,54 @@ impl TextLayout {
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
-        let mut element_state = self.0.borrow_mut();
-        let element_state = element_state
-            .as_mut()
+        self.measurement
+            .borrow()
+            .as_ref()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
-        element_state.bounds = Some(bounds);
+        self.bounds.set(Some(bounds));
     }
 
-    fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
-        let element_state = self.0.borrow();
+    fn paint(&self, text: &str, use_cached_raster_paint: bool, window: &mut Window, cx: &mut App) {
+        let element_state = self.measurement.borrow();
         let element_state = element_state
             .as_ref()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
-        let bounds = element_state
+        let bounds = self
             .bounds
+            .get()
             .with_context(|| format!("prepaint has not been performed on {text}"))
             .unwrap();
+
+        let text_style = window.text_style();
+        let scale_factor = window.scale_factor();
+        let scaled_origin = bounds.origin.scale(scale_factor);
+        let element_opacity = window.element_opacity();
+        let same_subpixel_phase = |left: Point<ScaledPixels>, right: Point<ScaledPixels>| {
+            let phase = |value: ScaledPixels| value.0.rem_euclid(1.0);
+            (phase(left.x) - phase(right.x)).abs() < f32::EPSILON
+                && (phase(left.y) - phase(right.y)).abs() < f32::EPSILON
+        };
+        if use_cached_raster_paint
+            && let Some(entry) = self.raster_paint_cache.borrow().iter().find(|entry| {
+                entry.text_style == text_style
+                    && entry.scale_factor_bits == scale_factor.to_bits()
+                    && entry.element_opacity_bits == element_opacity.to_bits()
+                    && entry.bounds_size == bounds.size
+                    && same_subpixel_phase(entry.source_origin, scaled_origin)
+            })
+        {
+            window.next_frame.scene.replay_cached_text(
+                &entry.operations,
+                scaled_origin - entry.source_origin,
+                window.content_mask().scale(scale_factor),
+                window.element_transform(),
+            );
+            return;
+        }
+
+        let paint_start = window.next_frame.scene.len();
 
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
@@ -477,17 +617,37 @@ impl TextLayout {
             .log_err();
             line_origin.y += line.size(line_height).height;
         }
+
+        if use_cached_raster_paint {
+            let paint_end = window.next_frame.scene.len();
+            if let Some(operations) = window
+                .next_frame
+                .scene
+                .clone_text_paint(paint_start..paint_end)
+            {
+                let mut cache = self.raster_paint_cache.borrow_mut();
+                if cache.len() == 2 {
+                    cache.remove(0);
+                }
+                cache.push(RasterTextPaintCacheEntry {
+                    text_style,
+                    scale_factor_bits: scale_factor.to_bits(),
+                    element_opacity_bits: element_opacity.to_bits(),
+                    bounds_size: bounds.size,
+                    source_origin: scaled_origin,
+                    operations,
+                });
+            }
+        }
     }
 
     /// Get the byte index into the input of the pixel position.
     pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
-        let element_state = self.0.borrow();
+        let element_state = self.measurement.borrow();
         let element_state = element_state
             .as_ref()
             .expect("measurement has not been performed");
-        let bounds = element_state
-            .bounds
-            .expect("prepaint has not been performed");
+        let bounds = self.bounds.get().expect("prepaint has not been performed");
 
         if position.y < bounds.top() {
             return Err(0);
@@ -515,13 +675,11 @@ impl TextLayout {
 
     /// Get the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
-        let element_state = self.0.borrow();
+        let element_state = self.measurement.borrow();
         let element_state = element_state
             .as_ref()
             .expect("measurement has not been performed");
-        let bounds = element_state
-            .bounds
-            .expect("prepaint has not been performed");
+        let bounds = self.bounds.get().expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
         let mut line_origin = bounds.origin;
@@ -546,13 +704,11 @@ impl TextLayout {
 
     /// Retrieve the layout for the line containing the given byte index.
     pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<WrappedLineLayout>> {
-        let element_state = self.0.borrow();
+        let element_state = self.measurement.borrow();
         let element_state = element_state
             .as_ref()
             .expect("measurement has not been performed");
-        let bounds = element_state
-            .bounds
-            .expect("prepaint has not been performed");
+        let bounds = self.bounds.get().expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
         let mut line_origin = bounds.origin;
@@ -576,22 +732,22 @@ impl TextLayout {
 
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.0.borrow().as_ref().unwrap().bounds.unwrap()
+        self.bounds.get().unwrap()
     }
 
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
-        self.0.borrow().as_ref().unwrap().line_height
+        self.measurement.borrow().as_ref().unwrap().line_height
     }
 
     /// The UTF-8 length of the underlying text.
     pub fn len(&self) -> usize {
-        self.0.borrow().as_ref().unwrap().len
+        self.measurement.borrow().as_ref().unwrap().len
     }
 
     /// The text for this layout.
     pub fn text(&self) -> String {
-        self.0
+        self.measurement
             .borrow()
             .as_ref()
             .unwrap()
@@ -605,7 +761,7 @@ impl TextLayout {
     /// The text for this layout (with soft-wraps as newlines)
     pub fn wrapped_text(&self) -> String {
         let mut lines = Vec::new();
-        for wrapped in self.0.borrow().as_ref().unwrap().lines.iter() {
+        for wrapped in self.measurement.borrow().as_ref().unwrap().lines.iter() {
             let mut seen = 0;
             for boundary in wrapped.layout.wrap_boundaries.iter() {
                 let index = wrapped.layout.unwrapped_layout.runs[boundary.run_ix].glyphs

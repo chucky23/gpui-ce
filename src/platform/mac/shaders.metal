@@ -740,20 +740,19 @@ fragment float4 polychrome_sprite_fragment(
 struct PathRasterizationVertexOutput {
   float4 position [[position]];
   float2 st_position;
-  uint vertex_id [[flat]];
   float clip_rect_distance [[clip_distance]][4];
 };
 
 struct PathRasterizationFragmentInput {
   float4 position [[position]];
   float2 st_position;
-  uint vertex_id [[flat]];
 };
 
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
   constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Viewport *viewport [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant Viewport *viewport [[buffer(PathRasterizationInputIndex_ViewportSize)]],
+  constant PathRasterizationStyle *style [[buffer(PathRasterizationInputIndex_Style)]]
 ) {
   PathRasterizationVertex v = vertices[vertex_id];
   float2 vertex_position = float2(v.xy_position.x, v.xy_position.y) -
@@ -766,26 +765,24 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
   return PathRasterizationVertexOutput{
       position,
       float2(v.st_position.x, v.st_position.y),
-      vertex_id,
       {
-        v.xy_position.x - v.bounds.origin.x,
-        v.bounds.origin.x + v.bounds.size.width - v.xy_position.x,
-        v.xy_position.y - v.bounds.origin.y,
-        v.bounds.origin.y + v.bounds.size.height - v.xy_position.y
+        v.xy_position.x - style->bounds.origin.x,
+        style->bounds.origin.x + style->bounds.size.width - v.xy_position.x,
+        v.xy_position.y - style->bounds.origin.y,
+        style->bounds.origin.y + style->bounds.size.height - v.xy_position.y
       }
   };
 }
 
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
+  constant PathRasterizationStyle *style [[buffer(PathRasterizationInputIndex_Style)]]
 ) {
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
 
-  PathRasterizationVertex v = vertices[input.vertex_id];
-  Background background = v.color;
-  Bounds_ScaledPixels path_bounds = v.bounds;
+  Background background = style->color;
+  Bounds_ScaledPixels path_bounds = style->bounds;
   float alpha;
   if (length(float2(dx.x, dy.x)) < 0.001) {
     alpha = 1.0;
@@ -876,8 +873,11 @@ vertex RasterTileVertexOutput raster_tile_vertex(
   RasterTileBounds tile = tiles[0];
   float gutter = float(tile.gutter);
   float2 texture_size = float2(tile.texture_size.width, tile.texture_size.height);
-  float2 core_size = texture_size - float2(2.0 * gutter);
-  float2 texture_coords = (float2(gutter) + unit_vertex * core_size) / texture_size;
+  float2 source_origin = float2(tile.source_origin.x, tile.source_origin.y);
+  float2 source_size = float2(tile.source_size.width, tile.source_size.height);
+  float2 core_size = source_size - float2(2.0 * gutter);
+  float2 texture_coords =
+    (source_origin + float2(gutter) + unit_vertex * core_size) / texture_size;
   float4 clip_distance = distance_from_clip_rect(
     unit_vertex,
     tile.bounds,

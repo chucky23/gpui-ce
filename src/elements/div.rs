@@ -19,11 +19,11 @@ use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
     Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
-    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
-    MagnifyEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, MagnifyEvent,
+    ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    Size, Style, StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea,
+    point, px, size,
 };
 use collections::HashMap;
 use refineable::Refineable;
@@ -1872,7 +1872,8 @@ impl Interactivity {
                             let sf = window.scale_factor();
                             let mut m = crate::TransformationMatrix::unit();
                             // Scale от top-left (origin-based)
-                            if let Some(s) = style.scale.filter(|s| (*s - 1.0).abs() > f32::EPSILON) {
+                            if let Some(s) = style.scale.filter(|s| (*s - 1.0).abs() > f32::EPSILON)
+                            {
                                 let origin = crate::point(
                                     crate::ScaledPixels(bounds.origin.x.0 * sf),
                                     crate::ScaledPixels(bounds.origin.y.0 * sf),
@@ -1881,8 +1882,12 @@ impl Interactivity {
                                     crate::ScaledPixels(-bounds.origin.x.0 * sf),
                                     crate::ScaledPixels(-bounds.origin.y.0 * sf),
                                 );
-                                m = m.translate(origin)
-                                    .scale(crate::Size { width: s, height: s })
+                                m = m
+                                    .translate(origin)
+                                    .scale(crate::Size {
+                                        width: s,
+                                        height: s,
+                                    })
                                     .translate(neg_origin);
                             }
                             // Rotation вокруг визуального центра (с учётом scale)
@@ -1892,8 +1897,10 @@ impl Interactivity {
                                 let cx_val = center.x.0 * sf;
                                 let cy_val = center.y.0 * sf;
                                 // При scale от top-left визуальный центр смещается
-                                let visual_cx = bounds.origin.x.0 * sf + (cx_val - bounds.origin.x.0 * sf) * visual_scale;
-                                let visual_cy = bounds.origin.y.0 * sf + (cy_val - bounds.origin.y.0 * sf) * visual_scale;
+                                let visual_cx = bounds.origin.x.0 * sf
+                                    + (cx_val - bounds.origin.x.0 * sf) * visual_scale;
+                                let visual_cy = bounds.origin.y.0 * sf
+                                    + (cy_val - bounds.origin.y.0 * sf) * visual_scale;
                                 let center_scaled = crate::point(
                                     crate::ScaledPixels(visual_cx),
                                     crate::ScaledPixels(visual_cy),
@@ -1902,7 +1909,8 @@ impl Interactivity {
                                     crate::ScaledPixels(-visual_cx),
                                     crate::ScaledPixels(-visual_cy),
                                 );
-                                m = m.translate(center_scaled)
+                                m = m
+                                    .translate(center_scaled)
                                     .rotate(angle)
                                     .translate(neg_center);
                             }
@@ -1912,68 +1920,75 @@ impl Interactivity {
                         }
                     };
                     window.with_element_transform(element_transform, |window| {
-                    style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
-                        window.with_text_style(style.text_style().cloned(), |window| {
-                            window.with_content_mask(
-                                style.overflow_mask(bounds, window.rem_size()),
-                                |window| {
-                                    window.with_tab_group(tab_group, |window| {
-                                        if let Some(hitbox) = hitbox {
-                                            #[cfg(debug_assertions)]
-                                            self.paint_debug_info(
-                                                global_id, hitbox, &style, window, cx,
-                                            );
+                        style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
+                            window.with_text_style(style.text_style().cloned(), |window| {
+                                window.with_content_mask(
+                                    style.overflow_mask(bounds, window.rem_size()),
+                                    |window| {
+                                        window.with_tab_group(tab_group, |window| {
+                                            if let Some(hitbox) = hitbox {
+                                                #[cfg(debug_assertions)]
+                                                self.paint_debug_info(
+                                                    global_id, hitbox, &style, window, cx,
+                                                );
 
-                                            if let Some(drag) = cx.active_drag.as_ref() {
-                                                if let Some(mouse_cursor) = drag.cursor_style {
-                                                    window.set_window_cursor_style(mouse_cursor);
+                                                if let Some(drag) = cx.active_drag.as_ref() {
+                                                    if let Some(mouse_cursor) = drag.cursor_style {
+                                                        window
+                                                            .set_window_cursor_style(mouse_cursor);
+                                                    }
+                                                } else {
+                                                    if let Some(mouse_cursor) = style.mouse_cursor {
+                                                        window
+                                                            .set_cursor_style(mouse_cursor, hitbox);
+                                                    }
                                                 }
-                                            } else {
-                                                if let Some(mouse_cursor) = style.mouse_cursor {
-                                                    window.set_cursor_style(mouse_cursor, hitbox);
+
+                                                if let Some(group) = self.group.clone() {
+                                                    GroupHitboxes::push(group, hitbox.id, cx);
                                                 }
-                                            }
 
-                                            if let Some(group) = self.group.clone() {
-                                                GroupHitboxes::push(group, hitbox.id, cx);
-                                            }
+                                                if let Some(area) = self.window_control {
+                                                    window.insert_window_control_hitbox(
+                                                        area,
+                                                        hitbox.clone(),
+                                                    );
+                                                }
 
-                                            if let Some(area) = self.window_control {
-                                                window.insert_window_control_hitbox(
-                                                    area,
-                                                    hitbox.clone(),
+                                                self.paint_mouse_listeners(
+                                                    hitbox,
+                                                    element_state.as_mut(),
+                                                    window,
+                                                    cx,
+                                                );
+                                                self.paint_scroll_listener(
+                                                    hitbox, &style, window, cx,
                                                 );
                                             }
 
-                                            self.paint_mouse_listeners(
-                                                hitbox,
-                                                element_state.as_mut(),
-                                                window,
-                                                cx,
-                                            );
-                                            self.paint_scroll_listener(hitbox, &style, window, cx);
-                                        }
+                                            self.paint_keyboard_listeners(window, cx);
+                                            f(&style, window, cx);
 
-                                        self.paint_keyboard_listeners(window, cx);
-                                        f(&style, window, cx);
+                                            if let Some(_hitbox) = hitbox {
+                                                #[cfg(any(
+                                                    feature = "inspector",
+                                                    debug_assertions
+                                                ))]
+                                                window.insert_inspector_hitbox(
+                                                    _hitbox.id,
+                                                    _inspector_id,
+                                                    cx,
+                                                );
 
-                                        if let Some(_hitbox) = hitbox {
-                                            #[cfg(any(feature = "inspector", debug_assertions))]
-                                            window.insert_inspector_hitbox(
-                                                _hitbox.id,
-                                                _inspector_id,
-                                                cx,
-                                            );
-
-                                            if let Some(group) = self.group.as_ref() {
-                                                GroupHitboxes::pop(group, cx);
+                                                if let Some(group) = self.group.as_ref() {
+                                                    GroupHitboxes::pop(group, cx);
+                                                }
                                             }
-                                        }
-                                    })
-                                },
-                            );
+                                        })
+                                    },
+                                );
+                            });
                         });
-                    });
                     });
                 });
 

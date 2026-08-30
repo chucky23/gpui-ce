@@ -701,12 +701,9 @@ impl Style {
                     bottom_bounds.top_right(),
                 );
 
-                window.with_content_mask(
-                    Some(ContentMask { bounds: top_bounds }),
-                    |window| {
-                        window.paint_quad(quad.clone());
-                    },
-                );
+                window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {
+                    window.paint_quad(quad.clone());
+                });
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: right_bounds,
