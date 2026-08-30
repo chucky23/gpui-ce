@@ -1,8 +1,7 @@
 use crate::{
-    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, MagnifyEvent, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
-    MouseUpEvent, NavigationDirection, Pixels, PlatformInput, ScrollDelta, ScrollWheelEvent,
-    TouchPhase,
+    Capslock, KeyDownEvent, KeyUpEvent, Keystroke, MagnifyEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+    Pixels, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase,
     platform::mac::{
         LMGetKbdType, NSStringExt, TISCopyCurrentKeyboardLayoutInputSource,
         TISGetInputSourceProperty, UCKeyTranslate, kTISPropertyUnicodeKeyLayoutData,

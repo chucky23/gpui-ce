@@ -1,10 +1,15 @@
 //! GPU-resident raster cache contracts.
 
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
-use std::time::{Duration, Instant};
+
+use crate::{Pixels, Point, point, px};
 
 /// Default point at which least-recently-used tiles begin to be evicted.
 pub const DEFAULT_RASTER_CACHE_SOFT_LIMIT_BYTES: usize = 224 * 1024 * 1024;
@@ -13,6 +18,203 @@ pub const DEFAULT_RASTER_CACHE_SOFT_LIMIT_BYTES: usize = 224 * 1024 * 1024;
 pub const DEFAULT_RASTER_CACHE_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
 static NEXT_RASTER_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_RASTER_COMPOSITOR_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Camera transform consumed by a platform compositor independently of scene rebuilding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RasterCompositorTransform {
+    /// Uniform Canvas scale.
+    pub scale: f32,
+    /// Canvas origin in window coordinates.
+    pub translation: Point<Pixels>,
+}
+
+impl RasterCompositorTransform {
+    /// Creates a finite transform with a positive scale.
+    pub fn new(scale: f32, translation: Point<Pixels>) -> Option<Self> {
+        (scale.is_finite()
+            && scale > 0.
+            && translation.x.0.is_finite()
+            && translation.y.0.is_finite())
+        .then_some(Self { scale, translation })
+    }
+}
+
+impl Default for RasterCompositorTransform {
+    fn default() -> Self {
+        Self {
+            scale: 1.,
+            translation: point(px(0.), px(0.)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RasterCompositorTransformState {
+    id: u64,
+    generation: AtomicU64,
+    scale_bits: AtomicU32,
+    translation_x_bits: AtomicU32,
+    translation_y_bits: AtomicU32,
+    updates: Mutex<VecDeque<(u64, Instant)>>,
+}
+
+/// Thread-safe latest-value camera transform for late compositor latching.
+///
+/// A generation sequence protects readers from observing a mixture of two updates. The handle
+/// carries no platform object and can therefore be updated directly from ordinary input handling.
+#[derive(Clone, Debug)]
+pub struct RasterCompositorTransformHandle(Arc<RasterCompositorTransformState>);
+
+impl RasterCompositorTransformHandle {
+    /// Creates a transform handle when the initial value is finite and has a positive scale.
+    pub fn new(initial: RasterCompositorTransform) -> Option<Self> {
+        RasterCompositorTransform::new(initial.scale, initial.translation).map(|initial| {
+            Self(Arc::new(RasterCompositorTransformState {
+                id: NEXT_RASTER_COMPOSITOR_ID.fetch_add(1, Ordering::Relaxed),
+                generation: AtomicU64::new(0),
+                scale_bits: AtomicU32::new(initial.scale.to_bits()),
+                translation_x_bits: AtomicU32::new(initial.translation.x.0.to_bits()),
+                translation_y_bits: AtomicU32::new(initial.translation.y.0.to_bits()),
+                updates: Mutex::new(VecDeque::from([(0, Instant::now())])),
+            }))
+        })
+    }
+
+    /// Publishes one coherent transform. Invalid values leave the previous value unchanged.
+    pub fn update(&self, transform: RasterCompositorTransform) -> bool {
+        self.update_at(transform, Instant::now())
+    }
+
+    /// Publishes one coherent transform associated with its original input observation time.
+    pub fn update_at(&self, transform: RasterCompositorTransform, updated_at: Instant) -> bool {
+        let Some(transform) =
+            RasterCompositorTransform::new(transform.scale, transform.translation)
+        else {
+            return false;
+        };
+        if self.snapshot().1 == transform {
+            return false;
+        }
+
+        let generation = loop {
+            let generation = self.0.generation.load(Ordering::SeqCst);
+            if generation & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .0
+                .generation
+                .compare_exchange(
+                    generation,
+                    generation.wrapping_add(1),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                break generation;
+            }
+        };
+
+        self.0
+            .scale_bits
+            .store(transform.scale.to_bits(), Ordering::SeqCst);
+        self.0
+            .translation_x_bits
+            .store(transform.translation.x.0.to_bits(), Ordering::SeqCst);
+        self.0
+            .translation_y_bits
+            .store(transform.translation.y.0.to_bits(), Ordering::SeqCst);
+        let revision = generation.wrapping_add(2) / 2;
+        let mut updates = self
+            .0
+            .updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        updates.push_back((revision, updated_at));
+        while updates.len() > 128 {
+            updates.pop_front();
+        }
+        drop(updates);
+        // Publish the even generation only after its timestamp is available. Otherwise a
+        // display-link reader could latch the transform first and fabricate a near-zero sample.
+        self.0
+            .generation
+            .store(generation.wrapping_add(2), Ordering::SeqCst);
+        true
+    }
+
+    /// Reads a coherent latest transform and its monotonic revision.
+    pub fn snapshot(&self) -> (u64, RasterCompositorTransform) {
+        loop {
+            let before = self.0.generation.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let transform = RasterCompositorTransform {
+                scale: f32::from_bits(self.0.scale_bits.load(Ordering::SeqCst)),
+                translation: point(
+                    px(f32::from_bits(
+                        self.0.translation_x_bits.load(Ordering::SeqCst),
+                    )),
+                    px(f32::from_bits(
+                        self.0.translation_y_bits.load(Ordering::SeqCst),
+                    )),
+                ),
+            };
+            let after = self.0.generation.load(Ordering::SeqCst);
+            if before == after {
+                return (after / 2, transform);
+            }
+        }
+    }
+
+    /// Stable namespace used to associate presentation samples with this handle.
+    pub fn id(&self) -> u64 {
+        self.0.id
+    }
+
+    pub(crate) fn updated_at(&self, revision: u64) -> Option<Instant> {
+        self.0
+            .updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .rev()
+            .find_map(|(candidate, updated_at)| (*candidate == revision).then_some(*updated_at))
+    }
+}
+
+impl PartialEq for RasterCompositorTransformHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id == other.0.id
+    }
+}
+
+impl Eq for RasterCompositorTransformHandle {}
+
+/// A camera revision observed on the Core Animation presentation layer.
+#[derive(Clone, Copy, Debug)]
+pub struct RasterCompositorPresentationSample {
+    /// Compositor namespace that produced the sample.
+    pub compositor_id: u64,
+    /// Transform revision visible in the presentation layer.
+    pub revision: u64,
+    /// Time at which input published the revision.
+    pub updated_at: Instant,
+    /// Display-link time at which the presentation layer exposed the revision.
+    pub presented_at: Instant,
+}
+
+impl RasterCompositorPresentationSample {
+    /// Latency from publishing the camera transform to observing it in presented layer state.
+    pub fn input_to_presentation(self) -> Duration {
+        self.presented_at.saturating_duration_since(self.updated_at)
+    }
+}
 
 /// Memory limits for one raster cache namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,16 +288,12 @@ impl RasterCacheHandle {
         &self,
         key: RasterTileKey,
         revision: RasterTileRevision,
-        texture_width: u32,
-        texture_height: u32,
         gutter: u32,
     ) -> RasterTileHit {
         RasterTileHit {
             cache: self.clone(),
             key,
             revision,
-            texture_width,
-            texture_height,
             gutter,
         }
     }
@@ -157,8 +355,6 @@ pub struct RasterTileHit {
     pub(crate) cache: RasterCacheHandle,
     pub(crate) key: RasterTileKey,
     pub(crate) revision: RasterTileRevision,
-    pub(crate) texture_width: u32,
-    pub(crate) texture_height: u32,
     pub(crate) gutter: u32,
 }
 
@@ -194,6 +390,14 @@ pub struct RasterCacheStats {
     pub hits: u64,
     /// Number of missing or stale lookups.
     pub misses: u64,
+    /// Number of completed diagnostic comparisons between detailed and tiled output.
+    pub comparison_samples: u64,
+    /// Lowest observed structural similarity, scaled by one billion.
+    pub comparison_min_ssim_ppb: u32,
+    /// Worst observed 99th-percentile absolute BGRA channel error.
+    pub comparison_p99_channel_error: u8,
+    /// Largest observed absolute BGRA channel error.
+    pub comparison_max_channel_error: u8,
 }
 
 /// Timing reported for a frame after its drawable was actually presented.
@@ -249,6 +453,77 @@ mod tests {
 
         assert_eq!(first, first_clone);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn compositor_transform_rejects_invalid_updates() {
+        let handle = RasterCompositorTransformHandle::new(RasterCompositorTransform::default())
+            .expect("default transform is valid");
+        assert!(!handle.update(RasterCompositorTransform {
+            scale: 0.,
+            translation: point(px(10.), px(20.)),
+        }));
+        assert_eq!(handle.snapshot(), (0, RasterCompositorTransform::default()));
+    }
+
+    #[test]
+    fn compositor_transform_snapshot_never_tears_between_writers() {
+        let handle = RasterCompositorTransformHandle::new(RasterCompositorTransform {
+            scale: 0.5,
+            translation: point(px(1.), px(1.5)),
+        })
+        .expect("initial transform is valid");
+        let writer = handle.clone();
+        let thread = std::thread::spawn(move || {
+            for value in 1..=10_000_u32 {
+                let value = value as f32;
+                assert!(writer.update(RasterCompositorTransform {
+                    scale: value,
+                    translation: point(px(value * 2.), px(value * 3.)),
+                }));
+            }
+        });
+
+        while !thread.is_finished() {
+            let (_, transform) = handle.snapshot();
+            assert_eq!(transform.translation.x.0, transform.scale * 2.);
+            assert_eq!(transform.translation.y.0, transform.scale * 3.);
+        }
+        thread.join().expect("writer must finish");
+        let (revision, transform) = handle.snapshot();
+        assert_eq!(revision, 10_000);
+        assert_eq!(transform.scale, 10_000.);
+    }
+
+    #[test]
+    fn compositor_transform_publishes_timestamp_with_revision() {
+        let handle = RasterCompositorTransformHandle::new(RasterCompositorTransform::default())
+            .expect("default transform is valid");
+        assert!(handle.update(RasterCompositorTransform {
+            scale: 2.,
+            translation: point(px(20.), px(30.)),
+        }));
+
+        let (revision, _) = handle.snapshot();
+        assert_eq!(revision, 1);
+        assert!(handle.updated_at(revision).is_some());
+    }
+
+    #[test]
+    fn compositor_transform_preserves_input_time_and_skips_identical_updates() {
+        let handle = RasterCompositorTransformHandle::new(RasterCompositorTransform::default())
+            .expect("default transform is valid");
+        let observed_at = Instant::now() - Duration::from_millis(3);
+        let transform = RasterCompositorTransform {
+            scale: 2.,
+            translation: point(px(20.), px(30.)),
+        };
+        assert!(handle.update_at(transform, observed_at));
+        assert!(!handle.update_at(transform, Instant::now()));
+
+        let (revision, _) = handle.snapshot();
+        assert_eq!(revision, 1);
+        assert_eq!(handle.updated_at(revision), Some(observed_at));
     }
 
     #[test]

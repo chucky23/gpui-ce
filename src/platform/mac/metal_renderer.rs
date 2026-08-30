@@ -2,28 +2,30 @@ use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, FramePresentationSample,
     MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    RasterCacheHandle, RasterCacheStats, RasterTile, RasterTileKey, RasterTileLookup,
-    RasterTileRevision, ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
+    RasterCacheHandle, RasterCacheStats, RasterCompositorPresentationSample, RasterTile,
+    RasterTileKey, RasterTileLookup, RasterTileRevision, ScaledPixels, Scene, Shadow, Size,
+    Surface, Underline, point, size,
 };
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES},
-    foundation::{NSSize, NSUInteger},
+    base::{NO, YES, id, nil},
+    foundation::{NSPoint, NSRect, NSSize, NSUInteger},
     quartzcore::{AutoresizingMask, current_media_time},
 };
 
 use core_foundation::base::TCFType;
+use core_graphics::geometry::CGAffineTransform;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
     pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions, NSRange,
-    RenderPassColorAttachmentDescriptorRef,
+    CAMetalLayer, CommandQueue, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions,
+    MTLSize, NSRange, RenderPassColorAttachmentDescriptorRef,
 };
-use objc::{self, msg_send, sel, sel_impl};
+use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
 use std::{
@@ -56,17 +58,252 @@ pub struct Viewport {
     pub origin: Point<ScaledPixels>,
 }
 
+struct CachedRasterAllocation {
+    texture: metal::Texture,
+    bytes: usize,
+}
+
 struct CachedRasterTexture {
     revision: u64,
-    texture: metal::Texture,
+    allocation: Arc<CachedRasterAllocation>,
+    source_origin: Point<DevicePixels>,
+    source_size: Size<DevicePixels>,
     gutter: u32,
-    bytes: usize,
     last_used_frame: u64,
 }
 
 struct RasterNamespace {
     owner: std::sync::Weak<crate::raster_cache::RasterCacheIdentity>,
     stats: RasterCacheStats,
+    comparisons: Arc<Mutex<RasterComparisonStats>>,
+}
+
+struct RasterCompositorLayer {
+    container: id,
+    layer: metal::MetalLayer,
+    handle: crate::RasterCompositorTransformHandle,
+    captured_transform: crate::RasterCompositorTransform,
+    clip_bounds: Bounds<ScaledPixels>,
+    raster_bounds: Bounds<ScaledPixels>,
+    last_applied: Option<AppliedRasterCompositorTransform>,
+    last_presented_revision: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct AppliedRasterCompositorTransform {
+    revision: u64,
+    position: NSPoint,
+    ratio: f32,
+    updated_at: Instant,
+}
+
+impl Drop for RasterCompositorLayer {
+    fn drop(&mut self) {
+        unsafe {
+            let _: () = msg_send![self.container, removeFromSuperlayer];
+            let _: () = msg_send![self.container, release];
+        }
+    }
+}
+
+fn new_raster_compositor_layer(
+    device: &metal::DeviceRef,
+    root_layer: &metal::MetalLayerRef,
+    handle: crate::RasterCompositorTransformHandle,
+    captured_transform: crate::RasterCompositorTransform,
+    clip_bounds: Bounds<ScaledPixels>,
+    raster_bounds: Bounds<ScaledPixels>,
+) -> RasterCompositorLayer {
+    let layer = metal::MetalLayer::new();
+    layer.set_device(device);
+    layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    layer.set_opaque(false);
+    layer.set_framebuffer_only(true);
+    layer.set_maximum_drawable_count(3);
+    let container: id = unsafe { msg_send![class!(CALayer), new] };
+    unsafe {
+        let _: () = msg_send![container, setMasksToBounds: YES];
+        let _: () = msg_send![container, setGeometryFlipped: YES];
+        let _: () = msg_send![layer.as_ref(), setGeometryFlipped: YES];
+        let _: () = msg_send![layer.as_ref(), setAnchorPoint: NSPoint { x: 0., y: 0. }];
+        let _: () = msg_send![container, addSublayer: layer.as_ref()];
+        let _: () = msg_send![root_layer, addSublayer: container];
+    }
+    let compositor = RasterCompositorLayer {
+        container,
+        layer,
+        handle,
+        captured_transform,
+        clip_bounds,
+        raster_bounds,
+        last_applied: None,
+        last_presented_revision: None,
+    };
+    configure_raster_compositor_geometry(&compositor, root_layer);
+    compositor
+}
+
+fn configure_raster_compositor_geometry(
+    compositor: &RasterCompositorLayer,
+    root_layer: &metal::MetalLayerRef,
+) {
+    let contents_scale: f64 = unsafe { msg_send![root_layer, contentsScale] };
+    let contents_scale = contents_scale.max(1.);
+    let root_bounds: NSRect = unsafe { msg_send![root_layer, bounds] };
+    let root_flipped: cocoa::base::BOOL = unsafe { msg_send![root_layer, isGeometryFlipped] };
+    let clip_x = compositor.clip_bounds.origin.x.0 as f64 / contents_scale;
+    let clip_y_top = compositor.clip_bounds.origin.y.0 as f64 / contents_scale;
+    let clip_width = compositor.clip_bounds.size.width.0 as f64 / contents_scale;
+    let clip_height = compositor.clip_bounds.size.height.0 as f64 / contents_scale;
+    let clip_y = if root_flipped == YES {
+        clip_y_top
+    } else {
+        root_bounds.size.height - clip_y_top - clip_height
+    };
+    let raster_width = compositor.raster_bounds.size.width.0 as f64 / contents_scale;
+    let raster_height = compositor.raster_bounds.size.height.0 as f64 / contents_scale;
+    unsafe {
+        let _: () = msg_send![compositor.container, setFrame: NSRect {
+            origin: NSPoint { x: clip_x, y: clip_y },
+            size: NSSize { width: clip_width, height: clip_height },
+        }];
+        let _: () = msg_send![compositor.layer.as_ref(), setBounds: NSRect {
+            origin: NSPoint { x: 0., y: 0. },
+            size: NSSize { width: raster_width, height: raster_height },
+        }];
+        let _: () = msg_send![compositor.layer.as_ref(), setContentsScale: contents_scale];
+    }
+    unsafe {
+        let _: () = msg_send![compositor.layer.as_ref(), setDrawableSize: NSSize {
+            width: compositor.raster_bounds.size.width.0.ceil() as f64,
+            height: compositor.raster_bounds.size.height.0.ceil() as f64,
+        }];
+    }
+}
+
+fn observe_raster_compositor_presentation(
+    compositor: &mut RasterCompositorLayer,
+    samples: &Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
+) {
+    let Some(applied) = compositor.last_applied else {
+        return;
+    };
+    if compositor.last_presented_revision == Some(applied.revision) {
+        return;
+    }
+    let presentation: id = unsafe { msg_send![compositor.layer.as_ref(), presentationLayer] };
+    if presentation == nil {
+        return;
+    }
+    let position: NSPoint = unsafe { msg_send![presentation, position] };
+    let transform: CGAffineTransform = unsafe { msg_send![presentation, affineTransform] };
+    if (position.x - applied.position.x).abs() > 0.25
+        || (position.y - applied.position.y).abs() > 0.25
+        || (transform.a - f64::from(applied.ratio)).abs() > 0.0005
+        || (transform.d - f64::from(applied.ratio)).abs() > 0.0005
+    {
+        return;
+    }
+    compositor.last_presented_revision = Some(applied.revision);
+    samples.lock().push(RasterCompositorPresentationSample {
+        compositor_id: compositor.handle.id(),
+        revision: applied.revision,
+        updated_at: applied.updated_at,
+        presented_at: Instant::now(),
+    });
+}
+
+fn apply_raster_compositor_transform(
+    compositor: &mut RasterCompositorLayer,
+    contents_scale: f32,
+    samples: &Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
+) {
+    observe_raster_compositor_presentation(compositor, samples);
+    let (revision, current) = compositor.handle.snapshot();
+    if compositor
+        .last_applied
+        .is_some_and(|applied| applied.revision == revision)
+    {
+        return;
+    }
+    let ratio = current.scale / compositor.captured_transform.scale;
+    let raster_origin_x = compositor.raster_bounds.origin.x.0 / contents_scale;
+    let raster_origin_y = compositor.raster_bounds.origin.y.0 / contents_scale;
+    let clip_origin_x = compositor.clip_bounds.origin.x.0 / contents_scale;
+    let clip_origin_y = compositor.clip_bounds.origin.y.0 / contents_scale;
+    let position = NSPoint {
+        x: (ratio * (raster_origin_x - compositor.captured_transform.translation.x.0)
+            + current.translation.x.0
+            - clip_origin_x) as f64,
+        y: (ratio * (raster_origin_y - compositor.captured_transform.translation.y.0)
+            + current.translation.y.0
+            - clip_origin_y) as f64,
+    };
+    let raster_size = NSSize {
+        width: compositor.raster_bounds.size.width.0 as f64 / f64::from(contents_scale),
+        height: compositor.raster_bounds.size.height.0 as f64 / f64::from(contents_scale),
+    };
+    let clip_size = NSSize {
+        width: compositor.clip_bounds.size.width.0 as f64 / f64::from(contents_scale),
+        height: compositor.clip_bounds.size.height.0 as f64 / f64::from(contents_scale),
+    };
+    if !raster_compositor_surface_covers_clip(position, ratio, raster_size, clip_size) {
+        // Keep the last complete frame until the ordinary scene pass captures a new surface.
+        // Applying an out-of-coverage transform would expose transparent pixels at the edge.
+        return;
+    }
+    let transform = CGAffineTransform::new(ratio as f64, 0., 0., ratio as f64, 0., 0.);
+    unsafe {
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        let _: () = msg_send![compositor.layer.as_ref(), setAffineTransform: transform];
+        let _: () = msg_send![compositor.layer.as_ref(), setPosition: position];
+        let _: () = msg_send![class!(CATransaction), commit];
+    }
+    compositor.last_applied = Some(AppliedRasterCompositorTransform {
+        revision,
+        position,
+        ratio,
+        updated_at: compositor
+            .handle
+            .updated_at(revision)
+            .unwrap_or_else(Instant::now),
+    });
+}
+
+fn raster_compositor_surface_covers_clip(
+    position: NSPoint,
+    ratio: f32,
+    raster_size: NSSize,
+    clip_size: NSSize,
+) -> bool {
+    const COVERAGE_EPSILON: f64 = 0.01;
+    if !ratio.is_finite() || ratio <= 0. {
+        return false;
+    }
+    let ratio = f64::from(ratio);
+    position.x <= COVERAGE_EPSILON
+        && position.y <= COVERAGE_EPSILON
+        && position.x + raster_size.width * ratio + COVERAGE_EPSILON >= clip_size.width
+        && position.y + raster_size.height * ratio + COVERAGE_EPSILON >= clip_size.height
+}
+
+#[derive(Default)]
+struct RasterComparisonStats {
+    samples: u64,
+    min_ssim_ppb: u32,
+    p99_channel_error: u8,
+    max_channel_error: u8,
+}
+
+impl RasterNamespace {
+    fn new(cache: &RasterCacheHandle) -> Self {
+        Self {
+            owner: cache.weak_identity(),
+            stats: RasterCacheStats::default(),
+            comparisons: Arc::new(Mutex::new(RasterComparisonStats::default())),
+        }
+    }
 }
 
 pub unsafe fn new_renderer(
@@ -96,6 +333,11 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+}
+
+struct DeferredRender {
+    command_buffer: metal::CommandBuffer,
+    instance_buffer: InstanceBuffer,
 }
 
 impl InstanceBufferPool {
@@ -148,14 +390,22 @@ pub(crate) struct MetalRenderer {
     path_sample_count: u32,
     raster_textures: HashMap<(u64, u64), CachedRasterTexture>,
     raster_namespaces: HashMap<u64, RasterNamespace>,
+    raster_compositor_layers: HashMap<u64, RasterCompositorLayer>,
+    raster_compositor_deferred_renders: Vec<DeferredRender>,
     frame_index: u64,
     presented_frame_samples: Arc<Mutex<Vec<FramePresentationSample>>>,
+    raster_compositor_presentation_samples: Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
 }
 
 #[repr(C)]
 pub struct PathRasterizationVertex {
     pub xy_position: Point<ScaledPixels>,
     pub st_position: Point<f32>,
+}
+
+#[derive(Clone)]
+#[repr(C)]
+pub struct PathRasterizationStyle {
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
 }
@@ -331,8 +581,11 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             raster_textures: HashMap::new(),
             raster_namespaces: HashMap::new(),
+            raster_compositor_layers: HashMap::new(),
+            raster_compositor_deferred_renders: Vec::new(),
             frame_index: 0,
             presented_frame_samples: Arc::new(Mutex::new(Vec::new())),
+            raster_compositor_presentation_samples: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -343,25 +596,16 @@ impl MetalRenderer {
         revision: RasterTileRevision,
     ) -> RasterTileLookup {
         self.prune_released_raster_caches();
-        let namespace =
-            self.raster_namespaces
-                .entry(cache.id())
-                .or_insert_with(|| RasterNamespace {
-                    owner: cache.weak_identity(),
-                    stats: RasterCacheStats::default(),
-                });
+        let namespace = self
+            .raster_namespaces
+            .entry(cache.id())
+            .or_insert_with(|| RasterNamespace::new(cache));
         if let Some(tile) = self.raster_textures.get_mut(&(cache.id(), key.value()))
             && tile.revision == revision.value()
         {
             tile.last_used_frame = self.frame_index;
             namespace.stats.hits += 1;
-            return RasterTileLookup::Hit(cache.tile_hit(
-                key,
-                revision,
-                tile.texture.width() as u32,
-                tile.texture.height() as u32,
-                tile.gutter,
-            ));
+            return RasterTileLookup::Hit(cache.tile_hit(key, revision, tile.gutter));
         }
         namespace.stats.misses += 1;
         RasterTileLookup::Miss(cache.tile_miss(key, revision))
@@ -370,7 +614,15 @@ impl MetalRenderer {
     pub fn raster_cache_stats(&self, cache: &RasterCacheHandle) -> RasterCacheStats {
         self.raster_namespaces
             .get(&cache.id())
-            .map(|namespace| namespace.stats)
+            .map(|namespace| {
+                let mut stats = namespace.stats;
+                let comparisons = namespace.comparisons.lock();
+                stats.comparison_samples = comparisons.samples;
+                stats.comparison_min_ssim_ppb = comparisons.min_ssim_ppb;
+                stats.comparison_p99_channel_error = comparisons.p99_channel_error;
+                stats.comparison_max_channel_error = comparisons.max_channel_error;
+                stats
+            })
             .unwrap_or_default()
     }
 
@@ -397,6 +649,27 @@ impl MetalRenderer {
 
     pub fn take_presented_frame_samples(&self) -> Vec<FramePresentationSample> {
         mem::take(&mut *self.presented_frame_samples.lock())
+    }
+
+    pub fn take_raster_compositor_presentation_samples(
+        &self,
+    ) -> Vec<RasterCompositorPresentationSample> {
+        mem::take(&mut *self.raster_compositor_presentation_samples.lock())
+    }
+
+    fn commit_deferred_renders(&self, deferred_renders: Vec<DeferredRender>) {
+        for deferred in deferred_renders {
+            let instance_buffer_pool = self.instance_buffer_pool.clone();
+            let instance_buffer = Cell::new(Some(deferred.instance_buffer));
+            let release = ConcreteBlock::new(move |_| {
+                if let Some(instance_buffer) = instance_buffer.take() {
+                    instance_buffer_pool.lock().release(instance_buffer);
+                }
+            });
+            let release = release.copy();
+            deferred.command_buffer.add_completed_handler(&release);
+            deferred.command_buffer.commit();
+        }
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -472,11 +745,127 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    pub fn update_raster_compositor_transforms(&mut self) {
+        let contents_scale: f64 = unsafe { msg_send![self.layer.as_ref(), contentsScale] };
+        let samples = self.raster_compositor_presentation_samples.clone();
+        for compositor in self.raster_compositor_layers.values_mut() {
+            apply_raster_compositor_transform(compositor, contents_scale.max(1.) as f32, &samples);
+        }
+    }
+
+    pub fn latch_raster_compositor_transform(&mut self, compositor_id: u64) -> bool {
+        let contents_scale: f64 = unsafe { msg_send![self.layer.as_ref(), contentsScale] };
+        let samples = self.raster_compositor_presentation_samples.clone();
+        let Some(compositor) = self.raster_compositor_layers.get_mut(&compositor_id) else {
+            return false;
+        };
+        apply_raster_compositor_transform(compositor, contents_scale.max(1.) as f32, &samples);
+        true
+    }
+
+    fn synchronize_raster_compositors(&mut self, scene: &Scene) {
+        let active_ids = scene
+            .raster_compositor_surfaces
+            .iter()
+            .map(|surface| surface.handle.id())
+            .collect::<HashSet<_>>();
+        self.raster_compositor_layers
+            .retain(|id, _| active_ids.contains(id));
+
+        for surface in &scene.raster_compositor_surfaces {
+            let id = surface.handle.id();
+            if !self.raster_compositor_layers.contains_key(&id) {
+                let compositor = new_raster_compositor_layer(
+                    &self.device,
+                    &self.layer,
+                    surface.handle.clone(),
+                    surface.captured_transform,
+                    surface.clip_bounds,
+                    surface.raster_bounds,
+                );
+                self.raster_compositor_layers.insert(id, compositor);
+            }
+
+            let layer = {
+                let compositor = self.raster_compositor_layers.get_mut(&id).unwrap();
+                if compositor.captured_transform != surface.captured_transform
+                    || compositor.clip_bounds != surface.clip_bounds
+                    || compositor.raster_bounds != surface.raster_bounds
+                {
+                    compositor.last_applied = None;
+                }
+                compositor.handle = surface.handle.clone();
+                compositor.captured_transform = surface.captured_transform;
+                compositor.clip_bounds = surface.clip_bounds;
+                compositor.raster_bounds = surface.raster_bounds;
+                configure_raster_compositor_geometry(compositor, &self.layer);
+                compositor.layer.clone()
+            };
+            self.draw_scene_to_compositor(&surface.scene, &layer, surface.raster_bounds);
+        }
+        self.update_raster_compositor_transforms();
+    }
+
+    fn draw_scene_to_compositor(
+        &mut self,
+        scene: &Scene,
+        layer: &metal::MetalLayerRef,
+        raster_bounds: Bounds<ScaledPixels>,
+    ) {
+        let Some(drawable) = layer.next_drawable() else {
+            return;
+        };
+        let viewport = Viewport {
+            size: size(
+                DevicePixels(raster_bounds.size.width.0.ceil() as i32),
+                DevicePixels(raster_bounds.size.height.0.ceil() as i32),
+            ),
+            origin: raster_bounds.origin,
+        };
+        loop {
+            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+            match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport) {
+                Ok((command_buffer, deferred_renders)) => {
+                    let instance_buffer_pool = self.instance_buffer_pool.clone();
+                    let instance_buffer = Cell::new(Some(instance_buffer));
+                    let release = ConcreteBlock::new(move |_| {
+                        if let Some(instance_buffer) = instance_buffer.take() {
+                            instance_buffer_pool.lock().release(instance_buffer);
+                        }
+                    });
+                    let release = release.copy();
+                    command_buffer.add_completed_handler(&release);
+                    command_buffer.present_drawable(drawable);
+                    command_buffer.commit();
+                    self.raster_compositor_deferred_renders
+                        .extend(deferred_renders);
+                    break;
+                }
+                Err(error) => {
+                    log::error!("failed to draw raster compositor surface: {error}");
+                    let mut pool = self.instance_buffer_pool.lock();
+                    let size = pool.buffer_size;
+                    if size >= 256 * 1024 * 1024 {
+                        break;
+                    }
+                    pool.reset(size * 2);
+                }
+            }
+        }
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
         {
             const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
             let required = required_instance_buffer_size(scene);
+            if required > MAX_INSTANCE_BUFFER_SIZE {
+                log::error!(
+                    "scene instance data requires {} bytes, above the {} byte renderer limit",
+                    required,
+                    MAX_INSTANCE_BUFFER_SIZE
+                );
+            }
             let mut pool = self.instance_buffer_pool.lock();
             if pool.buffer_size < required {
                 let target = required
@@ -491,6 +880,7 @@ impl MetalRenderer {
                 );
             }
         }
+        self.synchronize_raster_compositors(scene);
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -508,17 +898,19 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
+            let deferred = mem::take(&mut self.raster_compositor_deferred_renders);
+            self.commit_deferred_renders(deferred);
             return;
         };
 
         loop {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
 
-            let command_buffer =
+            let command_buffers =
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport);
 
-            match command_buffer {
-                Ok(command_buffer) => {
+            match command_buffers {
+                Ok((command_buffer, deferred_renders)) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -579,6 +971,9 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
+                    let mut deferred = mem::take(&mut self.raster_compositor_deferred_renders);
+                    deferred.extend(deferred_renders);
+                    self.commit_deferred_renders(deferred);
                     return;
                 }
                 Err(err) => {
@@ -600,6 +995,8 @@ impl MetalRenderer {
                 }
             }
         }
+        let deferred = mem::take(&mut self.raster_compositor_deferred_renders);
+        self.commit_deferred_renders(deferred);
     }
 
     fn draw_primitives(
@@ -608,9 +1005,10 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport: Viewport,
-    ) -> Result<metal::CommandBuffer> {
+    ) -> Result<(metal::CommandBuffer, Vec<DeferredRender>)> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        let mut deferred_renders = Vec::new();
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
@@ -618,6 +1016,13 @@ impl MetalRenderer {
             .raster_tiles
             .iter()
             .map(|tile| (tile.cache_id, tile.key))
+            .chain(
+                scene
+                    .raster_tile_update_batches
+                    .iter()
+                    .flat_map(|batch| batch.scene.raster_tiles.iter())
+                    .map(|tile| (tile.cache_id, tile.key)),
+            )
             .collect::<HashSet<_>>();
         for update in &scene.raster_tile_updates {
             let Some(texture) = self.prepare_raster_texture(update, &protected) else {
@@ -647,10 +1052,127 @@ impl MetalRenderer {
                 0.,
             )?;
         }
+        for batch in &scene.raster_tile_update_batches {
+            if batch.targets.is_empty() {
+                continue;
+            }
+            let Some(source_bounds) = batch
+                .targets
+                .iter()
+                .map(|target| target.source_bounds)
+                .reduce(|left, right| left.union(&right))
+            else {
+                continue;
+            };
+            let gutter = batch.gutter.0.max(0);
+            let covered_width = batch
+                .targets
+                .iter()
+                .map(|target| {
+                    (target.source_bounds.origin.x.0 - source_bounds.origin.x.0).round() as i32
+                        + batch.texture_size.width.0
+                })
+                .max()
+                .unwrap_or_default();
+            let covered_height = batch
+                .targets
+                .iter()
+                .map(|target| {
+                    (target.source_bounds.origin.y.0 - source_bounds.origin.y.0).round() as i32
+                        + batch.texture_size.height.0
+                })
+                .max()
+                .unwrap_or_default();
+            let batch_width =
+                (source_bounds.size.width.0.ceil() as i32 + 2 * gutter).max(covered_width);
+            let batch_height =
+                (source_bounds.size.height.0.ceil() as i32 + 2 * gutter).max(covered_height);
+            if batch_width <= 0 || batch_height <= 0 {
+                continue;
+            }
+
+            let batch_size = size(DevicePixels(batch_width), DevicePixels(batch_height));
+            let Some(batch_texture) =
+                self.prepare_raster_batch_texture(batch, source_bounds, batch_size, &protected)
+            else {
+                log::error!(
+                    "raster tile batch allocation skipped: cache={} targets={}",
+                    batch.cache.id(),
+                    batch.targets.len()
+                );
+                continue;
+            };
+            let batch_viewport = Viewport {
+                size: batch_size,
+                origin: point(
+                    source_bounds.origin.x - ScaledPixels(gutter as f32),
+                    source_bounds.origin.y - ScaledPixels(gutter as f32),
+                ),
+            };
+            if batch.deferred {
+                let deferred_command_buffer = command_queue.new_command_buffer();
+                let mut deferred_instance_buffer =
+                    self.instance_buffer_pool.lock().acquire(&self.device);
+                let mut deferred_instance_offset = 0;
+                self.encode_scene(
+                    &batch.scene,
+                    &batch_texture,
+                    batch_viewport,
+                    deferred_command_buffer,
+                    &mut deferred_instance_buffer,
+                    &mut deferred_instance_offset,
+                    0.,
+                )?;
+                if batch.verify {
+                    let comparisons = self
+                        .raster_namespaces
+                        .get(&batch.cache.id())
+                        .expect("raster batch allocation creates its namespace")
+                        .comparisons
+                        .clone();
+                    self.encode_raster_comparison(
+                        batch,
+                        &batch_texture,
+                        batch_size,
+                        batch_viewport,
+                        deferred_command_buffer,
+                        &mut deferred_instance_buffer,
+                        &mut deferred_instance_offset,
+                        comparisons,
+                    )?;
+                }
+                deferred_instance_buffer
+                    .metal_buffer
+                    .did_modify_range(NSRange {
+                        location: 0,
+                        length: deferred_instance_offset as NSUInteger,
+                    });
+                deferred_renders.push(DeferredRender {
+                    command_buffer: deferred_command_buffer.to_owned(),
+                    instance_buffer: deferred_instance_buffer,
+                });
+            } else {
+                self.encode_scene(
+                    &batch.scene,
+                    &batch_texture,
+                    batch_viewport,
+                    command_buffer,
+                    instance_buffer,
+                    &mut instance_offset,
+                    0.,
+                )?;
+            }
+        }
         let cache_limits = scene
             .raster_tile_updates
             .iter()
             .map(|update| (update.cache.id(), update.config.soft_limit_bytes()))
+            .chain(
+                scene
+                    .raster_tile_update_batches
+                    .iter()
+                    .map(|batch| (batch.cache.id(), batch.config.soft_limit_bytes())),
+            )
             .collect::<HashMap<_, _>>();
         for (cache_id, soft_limit) in cache_limits {
             while self
@@ -688,7 +1210,7 @@ impl MetalRenderer {
             location: 0,
             length: instance_offset as NSUInteger,
         });
-        Ok(command_buffer.to_owned())
+        Ok((command_buffer.to_owned(), deferred_renders))
     }
 
     fn encode_scene(
@@ -716,6 +1238,16 @@ impl MetalRenderer {
             });
 
         for batch in scene.batches() {
+            let batch_name = match &batch {
+                PrimitiveBatch::Shadows(_) => "shadows",
+                PrimitiveBatch::Quads(_) => "quads",
+                PrimitiveBatch::Paths(_) => "paths",
+                PrimitiveBatch::Underlines(_) => "underlines",
+                PrimitiveBatch::MonochromeSprites { .. } => "monochrome_sprites",
+                PrimitiveBatch::PolychromeSprites { .. } => "polychrome_sprites",
+                PrimitiveBatch::Surfaces(_) => "surfaces",
+                PrimitiveBatch::RasterTiles(_) => "raster_tiles",
+            };
             let ok = match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
                     shadows,
@@ -809,7 +1341,9 @@ impl MetalRenderer {
             if !ok {
                 command_encoder.end_encoding();
                 anyhow::bail!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    "scene too large at {batch_name}: offset={} capacity={}; {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
+                    *instance_offset,
+                    instance_buffer.size,
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -822,6 +1356,133 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_raster_comparison(
+        &mut self,
+        batch: &crate::RasterTileUpdateBatch,
+        reference_texture: &metal::TextureRef,
+        texture_size: Size<DevicePixels>,
+        viewport: Viewport,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        comparisons: Arc<Mutex<RasterComparisonStats>>,
+    ) -> Result<()> {
+        let width = texture_size.width.0.max(0) as usize;
+        let height = texture_size.height.0.max(0) as usize;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let candidate_texture = self.device.new_texture(&descriptor);
+
+        let mut candidate_scene = Scene::default();
+        for target in &batch.targets {
+            candidate_scene.insert_primitive(RasterTile {
+                order: 0,
+                bounds: target.source_bounds,
+                content_mask: ContentMask {
+                    bounds: target.source_bounds,
+                },
+                cache_id: batch.cache.id(),
+                key: target.key.value(),
+                revision: target.revision.value(),
+                gutter: batch.gutter.0.max(0) as u32,
+            });
+        }
+        candidate_scene.finish();
+        self.encode_scene(
+            &candidate_scene,
+            &candidate_texture,
+            viewport,
+            command_buffer,
+            instance_buffer,
+            instance_offset,
+            0.,
+        )?;
+
+        let row_bytes = width.saturating_mul(4).saturating_add(255) & !255;
+        let buffer_len = row_bytes.saturating_mul(height);
+        let reference_buffer = self
+            .device
+            .new_buffer(buffer_len as u64, MTLResourceOptions::StorageModeShared);
+        let candidate_buffer = self
+            .device
+            .new_buffer(buffer_len as u64, MTLResourceOptions::StorageModeShared);
+        let blit = command_buffer.new_blit_command_encoder();
+        let source_size = MTLSize::new(width as NSUInteger, height as NSUInteger, 1);
+        for (texture, buffer) in [
+            (reference_texture, reference_buffer.as_ref()),
+            (candidate_texture.as_ref(), candidate_buffer.as_ref()),
+        ] {
+            blit.copy_from_texture_to_buffer(
+                texture,
+                0,
+                0,
+                MTLOrigin::default(),
+                source_size,
+                buffer,
+                0,
+                row_bytes as NSUInteger,
+                buffer_len as NSUInteger,
+                MTLBlitOption::None,
+            );
+        }
+        blit.end_encoding();
+
+        let comparison_regions = batch
+            .targets
+            .iter()
+            .map(|target| RasterComparisonRegion {
+                x: (target.source_bounds.origin.x.0 - viewport.origin.x.0)
+                    .round()
+                    .max(0.) as usize,
+                y: (target.source_bounds.origin.y.0 - viewport.origin.y.0)
+                    .round()
+                    .max(0.) as usize,
+                width: target.source_bounds.size.width.0.round().max(0.) as usize,
+                height: target.source_bounds.size.height.0.round().max(0.) as usize,
+            })
+            .collect::<Vec<_>>();
+        let completed = ConcreteBlock::new(move |_| {
+            let reference = unsafe {
+                std::slice::from_raw_parts(reference_buffer.contents() as *const u8, buffer_len)
+            };
+            let candidate = unsafe {
+                std::slice::from_raw_parts(candidate_buffer.contents() as *const u8, buffer_len)
+            };
+            let sample = compare_bgra_images(
+                reference,
+                candidate,
+                width,
+                height,
+                row_bytes,
+                &comparison_regions,
+            );
+            let mut accumulated = comparisons.lock();
+            accumulated.samples = accumulated.samples.saturating_add(1);
+            accumulated.min_ssim_ppb = if accumulated.samples == 1 {
+                sample.ssim_ppb
+            } else {
+                accumulated.min_ssim_ppb.min(sample.ssim_ppb)
+            };
+            accumulated.p99_channel_error =
+                accumulated.p99_channel_error.max(sample.p99_channel_error);
+            accumulated.max_channel_error =
+                accumulated.max_channel_error.max(sample.max_channel_error);
+        });
+        let completed = completed.copy();
+        command_buffer.add_completed_handler(&completed);
         Ok(())
     }
 
@@ -869,24 +1530,45 @@ impl MetalRenderer {
         update: &crate::RasterTileUpdate,
         protected: &HashSet<(u64, u64)>,
     ) -> Option<metal::Texture> {
-        let cache_id = update.cache.id();
-        let key = update.key.value();
-        let revision = update.revision.value();
+        self.prepare_raster_texture_fields(
+            &update.cache,
+            update.config,
+            update.key,
+            update.revision,
+            update.texture_size,
+            update.gutter,
+            protected,
+        )
+    }
+
+    fn prepare_raster_texture_fields(
+        &mut self,
+        cache: &RasterCacheHandle,
+        config: crate::RasterCacheConfig,
+        tile_key: RasterTileKey,
+        tile_revision: RasterTileRevision,
+        texture_size: Size<DevicePixels>,
+        gutter: DevicePixels,
+        protected: &HashSet<(u64, u64)>,
+    ) -> Option<metal::Texture> {
+        let cache_id = cache.id();
+        let key = tile_key.value();
+        let revision = tile_revision.value();
         let texture_key = (cache_id, key);
-        let width = update.texture_size.width.0.max(0) as usize;
-        let height = update.texture_size.height.0.max(0) as usize;
+        let width = texture_size.width.0.max(0) as usize;
+        let height = texture_size.height.0.max(0) as usize;
         let bytes = width.checked_mul(height)?.checked_mul(4)?;
-        if width == 0 || height == 0 || bytes > update.config.hard_limit_bytes() {
+        if width == 0 || height == 0 || bytes > config.hard_limit_bytes() {
             return None;
         }
 
         if let Some(existing) = self.raster_textures.get_mut(&texture_key)
             && existing.revision == revision
-            && existing.texture.width() as usize == width
-            && existing.texture.height() as usize == height
+            && existing.source_size.width.0.max(0) as usize == width
+            && existing.source_size.height.0.max(0) as usize == height
         {
             existing.last_used_frame = self.frame_index;
-            return Some(existing.texture.clone());
+            return Some(existing.allocation.texture.clone());
         }
 
         self.remove_raster_texture(texture_key, false);
@@ -895,7 +1577,7 @@ impl MetalRenderer {
             .get(&cache_id)
             .map(|namespace| namespace.stats.resident_bytes + bytes)
             .unwrap_or(bytes)
-            > update.config.hard_limit_bytes()
+            > config.hard_limit_bytes()
         {
             let candidate = self
                 .raster_textures
@@ -920,25 +1602,119 @@ impl MetalRenderer {
         descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
         let texture = self.device.new_texture(&descriptor);
+        let allocation = Arc::new(CachedRasterAllocation {
+            texture: texture.clone(),
+            bytes,
+        });
         self.raster_textures.insert(
             texture_key,
             CachedRasterTexture {
                 revision,
-                texture: texture.clone(),
-                gutter: update.gutter.0.max(0) as u32,
-                bytes,
+                allocation: allocation.clone(),
+                source_origin: point(DevicePixels(0), DevicePixels(0)),
+                source_size: texture_size,
+                gutter: gutter.0.max(0) as u32,
                 last_used_frame: self.frame_index,
             },
         );
         let namespace = self
             .raster_namespaces
             .entry(cache_id)
-            .or_insert_with(|| RasterNamespace {
-                owner: update.cache.weak_identity(),
-                stats: RasterCacheStats::default(),
-            });
+            .or_insert_with(|| RasterNamespace::new(cache));
         namespace.stats.resident_bytes += bytes;
         namespace.stats.resident_tiles += 1;
+        Some(texture)
+    }
+
+    fn prepare_raster_batch_texture(
+        &mut self,
+        batch: &crate::RasterTileUpdateBatch,
+        source_bounds: Bounds<ScaledPixels>,
+        texture_size: Size<DevicePixels>,
+        protected: &HashSet<(u64, u64)>,
+    ) -> Option<metal::Texture> {
+        let cache_id = batch.cache.id();
+        let width = texture_size.width.0.max(0) as usize;
+        let height = texture_size.height.0.max(0) as usize;
+        let bytes = width.checked_mul(height)?.checked_mul(4)?;
+        if width == 0 || height == 0 || bytes > batch.config.hard_limit_bytes() {
+            return None;
+        }
+
+        let mut entries = Vec::with_capacity(batch.targets.len());
+        for target in &batch.targets {
+            let source_x =
+                (target.source_bounds.origin.x.0 - source_bounds.origin.x.0).round() as i32;
+            let source_y =
+                (target.source_bounds.origin.y.0 - source_bounds.origin.y.0).round() as i32;
+            if source_x < 0
+                || source_y < 0
+                || source_x.saturating_add(batch.texture_size.width.0) > texture_size.width.0
+                || source_y.saturating_add(batch.texture_size.height.0) > texture_size.height.0
+            {
+                return None;
+            }
+            entries.push((
+                target,
+                point(DevicePixels(source_x), DevicePixels(source_y)),
+            ));
+        }
+        for (target, _) in &entries {
+            self.remove_raster_texture((cache_id, target.key.value()), false);
+        }
+        while self
+            .raster_namespaces
+            .get(&cache_id)
+            .map(|namespace| namespace.stats.resident_bytes + bytes)
+            .unwrap_or(bytes)
+            > batch.config.hard_limit_bytes()
+        {
+            let candidate = self
+                .raster_textures
+                .iter()
+                .filter(|((candidate_cache, candidate_key), _)| {
+                    *candidate_cache == cache_id
+                        && !protected.contains(&(*candidate_cache, *candidate_key))
+                })
+                .min_by_key(|(_, texture)| texture.last_used_frame)
+                .map(|(key, _)| *key);
+            let Some(candidate) = candidate else {
+                return None;
+            };
+            self.remove_raster_texture(candidate, true);
+        }
+
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(width as u64);
+        descriptor.set_height(height as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = self.device.new_texture(&descriptor);
+        let allocation = Arc::new(CachedRasterAllocation {
+            texture: texture.clone(),
+            bytes,
+        });
+        for (target, source_origin) in entries {
+            self.raster_textures.insert(
+                (cache_id, target.key.value()),
+                CachedRasterTexture {
+                    revision: target.revision.value(),
+                    allocation: allocation.clone(),
+                    source_origin,
+                    source_size: batch.texture_size,
+                    gutter: batch.gutter.0.max(0) as u32,
+                    last_used_frame: self.frame_index,
+                },
+            );
+        }
+        let namespace = self
+            .raster_namespaces
+            .entry(cache_id)
+            .or_insert_with(|| RasterNamespace::new(&batch.cache));
+        namespace.stats.resident_bytes += bytes;
+        namespace.stats.resident_tiles += batch.targets.len();
         Some(texture)
     }
 
@@ -946,9 +1722,14 @@ impl MetalRenderer {
         let Some(texture) = self.raster_textures.remove(&key) else {
             return;
         };
+        let allocation_released = Arc::strong_count(&texture.allocation) == 1;
         if let Some(namespace) = self.raster_namespaces.get_mut(&key.0) {
-            namespace.stats.resident_bytes =
-                namespace.stats.resident_bytes.saturating_sub(texture.bytes);
+            if allocation_released {
+                namespace.stats.resident_bytes = namespace
+                    .stats
+                    .resident_bytes
+                    .saturating_sub(texture.allocation.bytes);
+            }
             namespace.stats.resident_tiles = namespace.stats.resident_tiles.saturating_sub(1);
             if evicted {
                 namespace.stats.evicted_tiles += 1;
@@ -993,52 +1774,63 @@ impl MetalRenderer {
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
-        align_offset(instance_offset);
-        let mut vertices = Vec::new();
         for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
+            align_offset(instance_offset);
+            let vertices = path
+                .vertices
+                .iter()
+                .map(|vertex| PathRasterizationVertex {
+                    xy_position: vertex.xy_position,
+                    st_position: vertex.st_position,
+                })
+                .collect::<Vec<_>>();
+            let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
+            let next_offset = *instance_offset + vertices_bytes_len;
+            if next_offset > instance_buffer.size {
+                command_encoder.end_encoding();
+                return false;
+            }
+            let style = PathRasterizationStyle {
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
-            }));
-        }
-        let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
-        let next_offset = *instance_offset + vertices_bytes_len;
-        if next_offset > instance_buffer.size {
-            command_encoder.end_encoding();
-            return false;
-        }
-        command_encoder.set_vertex_buffer(
-            PathRasterizationInputIndex::Vertices as u64,
-            Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
-        );
-        command_encoder.set_vertex_bytes(
-            PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport) as u64,
-            &viewport as *const Viewport as *const _,
-        );
-        command_encoder.set_fragment_buffer(
-            PathRasterizationInputIndex::Vertices as u64,
-            Some(&instance_buffer.metal_buffer),
-            *instance_offset as u64,
-        );
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
-        unsafe {
-            ptr::copy_nonoverlapping(
-                vertices.as_ptr() as *const u8,
-                buffer_contents,
-                vertices_bytes_len,
+            };
+            command_encoder.set_vertex_buffer(
+                PathRasterizationInputIndex::Vertices as u64,
+                Some(&instance_buffer.metal_buffer),
+                *instance_offset as u64,
             );
+            command_encoder.set_vertex_bytes(
+                PathRasterizationInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport) as u64,
+                &viewport as *const Viewport as *const _,
+            );
+            command_encoder.set_vertex_bytes(
+                PathRasterizationInputIndex::Style as u64,
+                mem::size_of_val(&style) as u64,
+                &style as *const PathRasterizationStyle as *const _,
+            );
+            command_encoder.set_fragment_bytes(
+                PathRasterizationInputIndex::Style as u64,
+                mem::size_of_val(&style) as u64,
+                &style as *const PathRasterizationStyle as *const _,
+            );
+            let buffer_contents = unsafe {
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    vertices.as_ptr() as *const u8,
+                    buffer_contents,
+                    vertices_bytes_len,
+                );
+            }
+            command_encoder.draw_primitives(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                vertices.len() as u64,
+            );
+            *instance_offset = next_offset;
         }
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            vertices.len() as u64,
-        );
-        *instance_offset = next_offset;
 
         command_encoder.end_encoding();
         true
@@ -1592,7 +2384,6 @@ impl MetalRenderer {
                 .raster_textures
                 .get(&(tile.cache_id, tile.key))
                 .filter(|entry| entry.revision == tile.revision)
-                .map(|entry| &entry.texture)
             else {
                 continue;
             };
@@ -1611,9 +2402,11 @@ impl MetalRenderer {
                         bounds: tile.bounds,
                         content_mask: tile.content_mask.clone(),
                         texture_size: size(
-                            DevicePixels(tile.texture_width as i32),
-                            DevicePixels(tile.texture_height as i32),
+                            DevicePixels(texture.allocation.texture.width() as i32),
+                            DevicePixels(texture.allocation.texture.height() as i32),
                         ),
+                        source_origin: texture.source_origin,
+                        source_size: texture.source_size,
                         gutter: DevicePixels(tile.gutter as i32),
                         _padding: DevicePixels(0),
                     },
@@ -1624,8 +2417,10 @@ impl MetalRenderer {
                 Some(&instance_buffer.metal_buffer),
                 *instance_offset as u64,
             );
-            command_encoder
-                .set_fragment_texture(RasterTileInputIndex::Texture as u64, Some(texture));
+            command_encoder.set_fragment_texture(
+                RasterTileInputIndex::Texture as u64,
+                Some(&texture.allocation.texture),
+            );
             command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
             *instance_offset = next_offset;
         }
@@ -1767,6 +2562,219 @@ fn build_path_rasterization_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RasterComparisonSample {
+    ssim_ppb: u32,
+    p99_channel_error: u8,
+    max_channel_error: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RasterComparisonRegion {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+fn compare_bgra_images(
+    reference: &[u8],
+    candidate: &[u8],
+    width: usize,
+    height: usize,
+    row_bytes: usize,
+    regions: &[RasterComparisonRegion],
+) -> RasterComparisonSample {
+    let mut count = 0_u64;
+    let mut channel_count = 0_u64;
+    let mut reference_sum = 0_f64;
+    let mut candidate_sum = 0_f64;
+    let mut reference_squared_sum = 0_f64;
+    let mut candidate_squared_sum = 0_f64;
+    let mut product_sum = 0_f64;
+    let mut errors = [0_u64; 256];
+
+    for region in regions {
+        let start_x = region.x.min(width);
+        let start_y = region.y.min(height);
+        let end_x = region.x.saturating_add(region.width).min(width);
+        let end_y = region.y.saturating_add(region.height).min(height);
+        for y in start_y..end_y {
+            let row = y.saturating_mul(row_bytes);
+            for x in start_x..end_x {
+                let offset = row.saturating_add(x.saturating_mul(4));
+                if offset.saturating_add(4) > reference.len()
+                    || offset.saturating_add(4) > candidate.len()
+                {
+                    continue;
+                }
+                let reference_pixel = &reference[offset..offset + 4];
+                let candidate_pixel = &candidate[offset..offset + 4];
+                for channel in 0..4 {
+                    let error = reference_pixel[channel].abs_diff(candidate_pixel[channel]);
+                    errors[usize::from(error)] = errors[usize::from(error)].saturating_add(1);
+                    channel_count = channel_count.saturating_add(1);
+                }
+                let luma = |pixel: &[u8]| {
+                    (77. * f64::from(pixel[2])
+                        + 150. * f64::from(pixel[1])
+                        + 29. * f64::from(pixel[0]))
+                        / 256.
+                };
+                let reference_luma = luma(reference_pixel);
+                let candidate_luma = luma(candidate_pixel);
+                reference_sum += reference_luma;
+                candidate_sum += candidate_luma;
+                reference_squared_sum += reference_luma * reference_luma;
+                candidate_squared_sum += candidate_luma * candidate_luma;
+                product_sum += reference_luma * candidate_luma;
+                count = count.saturating_add(1);
+            }
+        }
+    }
+
+    if count == 0 || channel_count == 0 {
+        return RasterComparisonSample {
+            ssim_ppb: 0,
+            p99_channel_error: u8::MAX,
+            max_channel_error: u8::MAX,
+        };
+    }
+    let count_f64 = count as f64;
+    let reference_mean = reference_sum / count_f64;
+    let candidate_mean = candidate_sum / count_f64;
+    let reference_variance =
+        (reference_squared_sum / count_f64 - reference_mean * reference_mean).max(0.);
+    let candidate_variance =
+        (candidate_squared_sum / count_f64 - candidate_mean * candidate_mean).max(0.);
+    let covariance = product_sum / count_f64 - reference_mean * candidate_mean;
+    let c1 = (0.01_f64 * 255.).powi(2);
+    let c2 = (0.03_f64 * 255.).powi(2);
+    let ssim = (((2. * reference_mean * candidate_mean + c1) * (2. * covariance + c2))
+        / ((reference_mean.powi(2) + candidate_mean.powi(2) + c1)
+            * (reference_variance + candidate_variance + c2)))
+        .clamp(0., 1.);
+    let p99_rank = channel_count.saturating_mul(99).div_ceil(100);
+    let mut cumulative = 0_u64;
+    let mut p99_channel_error = None;
+    let mut max_channel_error = 0_u8;
+    for (error, occurrences) in errors.into_iter().enumerate() {
+        if occurrences == 0 {
+            continue;
+        }
+        max_channel_error = error as u8;
+        cumulative = cumulative.saturating_add(occurrences);
+        if cumulative >= p99_rank && p99_channel_error.is_none() {
+            p99_channel_error = Some(error as u8);
+        }
+    }
+    RasterComparisonSample {
+        ssim_ppb: (ssim * 1_000_000_000.).round() as u32,
+        p99_channel_error: p99_channel_error.unwrap_or(max_channel_error),
+        max_channel_error,
+    }
+}
+
+#[cfg(test)]
+mod raster_comparison_tests {
+    use super::*;
+
+    #[test]
+    fn identical_images_have_perfect_similarity() {
+        let image = vec![17_u8; 4 * 4 * 4];
+        let regions = [RasterComparisonRegion {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        assert_eq!(
+            compare_bgra_images(&image, &image, 4, 4, 16, &regions),
+            RasterComparisonSample {
+                ssim_ppb: 1_000_000_000,
+                p99_channel_error: 0,
+                max_channel_error: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn comparison_reports_channel_error_and_honors_gutter() {
+        let reference = vec![0_u8; 4 * 4 * 4];
+        let mut candidate = reference.clone();
+        candidate[0] = 255;
+        let inner_region = [RasterComparisonRegion {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        }];
+        assert_eq!(
+            compare_bgra_images(&reference, &candidate, 4, 4, 16, &inner_region),
+            RasterComparisonSample {
+                ssim_ppb: 1_000_000_000,
+                p99_channel_error: 0,
+                max_channel_error: 0,
+            }
+        );
+        let full_region = [RasterComparisonRegion {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        }];
+        let sample = compare_bgra_images(&reference, &candidate, 4, 4, 16, &full_region);
+        assert_eq!(sample.max_channel_error, 255);
+    }
+
+    #[test]
+    fn renderer_instance_types_remain_compact() {
+        assert!(mem::size_of::<MonochromeSprite>() <= 128);
+        assert!(mem::size_of::<Quad>() <= 192);
+        assert!(mem::size_of::<Shadow>() <= 192);
+        assert_eq!(mem::size_of::<PathRasterizationVertex>(), 16);
+    }
+
+    #[test]
+    fn compositor_rejects_transforms_that_expose_uncaptured_pixels() {
+        let raster_size = NSSize {
+            width: 1_824.,
+            height: 1_024.,
+        };
+        let clip_size = NSSize {
+            width: 800.,
+            height: 600.,
+        };
+        assert!(raster_compositor_surface_covers_clip(
+            NSPoint { x: -512., y: -212. },
+            1.,
+            raster_size,
+            clip_size,
+        ));
+        assert!(!raster_compositor_surface_covers_clip(
+            NSPoint { x: 1., y: -212. },
+            1.,
+            raster_size,
+            clip_size,
+        ));
+        assert!(!raster_compositor_surface_covers_clip(
+            NSPoint {
+                x: -1_025.,
+                y: -212.
+            },
+            1.,
+            raster_size,
+            clip_size,
+        ));
+        assert!(!raster_compositor_surface_covers_clip(
+            NSPoint { x: -512., y: -212. },
+            0.,
+            raster_size,
+            clip_size,
+        ));
+    }
+}
+
 fn required_instance_buffer_size(scene: &Scene) -> usize {
     fn reserve(offset: &mut usize, bytes: usize) {
         if bytes == 0 {
@@ -1782,14 +2790,14 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
                 PrimitiveBatch::Shadows(values) => reserve(offset, mem::size_of_val(values)),
                 PrimitiveBatch::Quads(values) => reserve(offset, mem::size_of_val(values)),
                 PrimitiveBatch::Paths(paths) => {
-                    let vertex_count = paths
-                        .iter()
-                        .map(|path| path.vertices.len())
-                        .fold(0usize, usize::saturating_add);
-                    reserve(
-                        offset,
-                        vertex_count.saturating_mul(mem::size_of::<PathRasterizationVertex>()),
-                    );
+                    for path in paths {
+                        reserve(
+                            offset,
+                            path.vertices
+                                .len()
+                                .saturating_mul(mem::size_of::<PathRasterizationVertex>()),
+                        );
+                    }
                     let sprite_count = paths.first().map_or(0, |first| {
                         if paths.last().is_some_and(|last| last.order == first.order) {
                             paths.len()
@@ -1827,8 +2835,37 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
     for update in &scene.raster_tile_updates {
         visit(&update.scene, &mut required);
     }
+    for batch in scene
+        .raster_tile_update_batches
+        .iter()
+        .filter(|batch| !batch.deferred)
+    {
+        visit(&batch.scene, &mut required);
+    }
     visit(scene, &mut required);
-    required
+    let deferred_required = scene
+        .raster_tile_update_batches
+        .iter()
+        .filter(|batch| batch.deferred)
+        .map(|batch| {
+            let mut batch_required = 0;
+            visit(&batch.scene, &mut batch_required);
+            if batch.verify {
+                for _ in &batch.targets {
+                    reserve(&mut batch_required, mem::size_of::<RasterTileBounds>());
+                }
+            }
+            batch_required
+        })
+        .max()
+        .unwrap_or_default();
+    let compositor_required = scene
+        .raster_compositor_surfaces
+        .iter()
+        .map(|surface| required_instance_buffer_size(&surface.scene))
+        .max()
+        .unwrap_or_default();
+    required.max(deferred_required).max(compositor_required)
 }
 
 // Align to multiples of 256 make Metal happy.
@@ -1880,6 +2917,7 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+    Style = 2,
 }
 
 #[repr(C)]
@@ -1909,6 +2947,8 @@ pub struct RasterTileBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub texture_size: Size<DevicePixels>,
+    pub source_origin: Point<DevicePixels>,
+    pub source_size: Size<DevicePixels>,
     pub gutter: DevicePixels,
     pub _padding: DevicePixels,
 }

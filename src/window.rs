@@ -10,11 +10,11 @@ use crate::{
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, RasterCacheHandle, RasterCacheStats, RasterTileKey,
-    RasterTileLookup, RasterTileRevision, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    Priority, PromptButton, PromptLevel, Quad, RasterCacheHandle, RasterCacheStats,
+    RasterCompositorPresentationSample, RasterTileKey, RasterTileLookup, RasterTileRevision,
+    Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextStyle, TextStyleRefinement,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
@@ -1920,6 +1920,23 @@ impl Window {
     /// Returns renderer-owned resource counters for one raster cache.
     pub fn raster_cache_stats(&self, cache: &RasterCacheHandle) -> RasterCacheStats {
         self.platform_window.raster_cache_stats(cache)
+    }
+
+    /// Drains camera transforms confirmed by the platform presentation layer.
+    pub fn take_raster_compositor_presentation_samples(
+        &self,
+    ) -> Vec<RasterCompositorPresentationSample> {
+        self.platform_window
+            .take_raster_compositor_presentation_samples()
+    }
+
+    /// Immediately latches the latest camera transform into an existing platform surface.
+    pub fn latch_raster_compositor_transform(
+        &self,
+        handle: &crate::RasterCompositorTransformHandle,
+    ) -> bool {
+        self.platform_window
+            .latch_raster_compositor_transform(handle)
     }
 
     /// Releases all platform resources associated with one raster cache.

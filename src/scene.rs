@@ -35,6 +35,8 @@ pub(crate) struct Scene {
     pub(crate) surfaces: Vec<PaintSurface>,
     pub(crate) raster_tiles: Vec<RasterTile>,
     pub(crate) raster_tile_updates: Vec<RasterTileUpdate>,
+    pub(crate) raster_tile_update_batches: Vec<RasterTileUpdateBatch>,
+    pub(crate) raster_compositor_surfaces: Vec<RasterCompositorSurface>,
 }
 
 impl Scene {
@@ -51,6 +53,8 @@ impl Scene {
         self.surfaces.clear();
         self.raster_tiles.clear();
         self.raster_tile_updates.clear();
+        self.raster_tile_update_batches.clear();
+        self.raster_compositor_surfaces.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +137,74 @@ impl Scene {
         }
     }
 
+    pub(crate) fn clone_text_paint(&self, range: Range<usize>) -> Option<Vec<PaintOperation>> {
+        self.paint_operations[range]
+            .iter()
+            .map(|operation| match operation {
+                PaintOperation::Primitive(Primitive::MonochromeSprite(_))
+                | PaintOperation::Primitive(Primitive::PolychromeSprite(_))
+                | PaintOperation::StartLayer(_)
+                | PaintOperation::EndLayer => Some(operation.clone()),
+                PaintOperation::Primitive(_) => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn replay_cached_text(
+        &mut self,
+        operations: &[PaintOperation],
+        origin_delta: Point<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+        transformation: TransformationMatrix,
+    ) {
+        for operation in operations {
+            match operation {
+                PaintOperation::StartLayer(template_bounds) => {
+                    let mut bounds = *template_bounds;
+                    bounds.origin += origin_delta;
+                    let clipped_bounds = bounds.intersect(&content_mask.bounds);
+                    if clipped_bounds.is_empty() {
+                        self.layer_stack
+                            .push(self.layer_stack.last().copied().unwrap_or(DrawOrder::MAX));
+                    } else {
+                        let order = self.primitive_bounds.insert(clipped_bounds);
+                        self.layer_stack.push(order);
+                    }
+                }
+                PaintOperation::EndLayer => {
+                    self.layer_stack.pop();
+                }
+                PaintOperation::Primitive(Primitive::MonochromeSprite(template)) => {
+                    let mut sprite = template.clone();
+                    sprite.bounds.origin += origin_delta;
+                    sprite.content_mask = content_mask.clone();
+                    sprite.transformation = transformation;
+                    sprite.order = self
+                        .layer_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| self.primitive_bounds.insert(sprite.bounds));
+                    self.monochrome_sprites.push(sprite);
+                }
+                PaintOperation::Primitive(Primitive::PolychromeSprite(template)) => {
+                    let mut sprite = template.clone();
+                    sprite.bounds.origin += origin_delta;
+                    sprite.content_mask = content_mask.clone();
+                    sprite.transformation = transformation;
+                    sprite.order = self
+                        .layer_stack
+                        .last()
+                        .copied()
+                        .unwrap_or_else(|| self.primitive_bounds.insert(sprite.bounds));
+                    self.polychrome_sprites.push(sprite);
+                }
+                PaintOperation::Primitive(_) => {
+                    unreachable!("cached text only contains layers and sprite primitives")
+                }
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
@@ -203,6 +275,7 @@ pub(crate) enum PrimitiveKind {
     RasterTile,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -497,8 +570,6 @@ pub(crate) struct RasterTile {
     pub cache_id: u64,
     pub key: u64,
     pub revision: u64,
-    pub texture_width: u32,
-    pub texture_height: u32,
     pub gutter: u32,
 }
 
@@ -516,6 +587,31 @@ pub(crate) struct RasterTileUpdate {
     pub texture_size: Size<DevicePixels>,
     pub gutter: DevicePixels,
     pub source_bounds: Bounds<ScaledPixels>,
+    pub scene: Scene,
+}
+
+pub(crate) struct RasterTileUpdateBatch {
+    pub cache: RasterCacheHandle,
+    pub config: RasterCacheConfig,
+    pub texture_size: Size<DevicePixels>,
+    pub gutter: DevicePixels,
+    pub targets: Vec<RasterTileUpdateTarget>,
+    pub scene: Scene,
+    pub deferred: bool,
+    pub verify: bool,
+}
+
+pub(crate) struct RasterTileUpdateTarget {
+    pub key: RasterTileKey,
+    pub revision: RasterTileRevision,
+    pub source_bounds: Bounds<ScaledPixels>,
+}
+
+pub(crate) struct RasterCompositorSurface {
+    pub handle: crate::RasterCompositorTransformHandle,
+    pub captured_transform: crate::RasterCompositorTransform,
+    pub clip_bounds: Bounds<ScaledPixels>,
+    pub raster_bounds: Bounds<ScaledPixels>,
     pub scene: Scene,
 }
 

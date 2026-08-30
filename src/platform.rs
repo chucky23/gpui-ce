@@ -40,10 +40,10 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, FramePresentationSample, GlyphId, GpuSpecs, ImageSource, Keymap,
     LineLayout, Pixels, PlatformInput, Point, Priority, RasterCacheHandle, RasterCacheStats,
-    RasterTileKey, RasterTileLookup, RasterTileRevision, RealtimePriority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, TaskLabel, TaskTiming, ThreadTaskTimings, Window,
-    WindowControlArea, hash, point, px, size,
+    RasterCompositorPresentationSample, RasterTileKey, RasterTileLookup, RasterTileRevision,
+    RealtimePriority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
+    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TaskLabel,
+    TaskTiming, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -529,6 +529,17 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     fn take_presented_frame_samples(&self) -> Vec<FramePresentationSample> {
         Vec::new()
+    }
+    fn take_raster_compositor_presentation_samples(
+        &self,
+    ) -> Vec<RasterCompositorPresentationSample> {
+        Vec::new()
+    }
+    fn latch_raster_compositor_transform(
+        &self,
+        _handle: &crate::RasterCompositorTransformHandle,
+    ) -> bool {
+        false
     }
 
     // macOS specific methods
