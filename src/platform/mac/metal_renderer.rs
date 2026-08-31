@@ -746,23 +746,10 @@ impl MetalRenderer {
             return;
         }
 
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.0 as u64);
-        texture_descriptor.set_height(size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
-
-        if self.path_sample_count > 1 {
-            let mut msaa_descriptor = texture_descriptor;
-            msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
-        } else {
-            self.path_intermediate_msaa_texture = None;
-        }
+        (
+            self.path_intermediate_texture,
+            self.path_intermediate_msaa_texture,
+        ) = self.allocate_path_intermediate_textures(size);
     }
 
     pub fn update_transparency(&self, _transparent: bool) {
@@ -1573,21 +1560,41 @@ impl MetalRenderer {
                 self.path_intermediate_msaa_texture.clone(),
             );
         }
+        self.allocate_path_intermediate_textures(size)
+    }
+
+    fn allocate_path_intermediate_textures(
+        &self,
+        size: Size<DevicePixels>,
+    ) -> (Option<metal::Texture>, Option<metal::Texture>) {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             return (None, None);
         }
 
-        let descriptor = metal::TextureDescriptor::new();
-        descriptor.set_width(size.width.0 as u64);
-        descriptor.set_height(size.height.0 as u64);
-        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        descriptor
+        let resolve_descriptor = metal::TextureDescriptor::new();
+        resolve_descriptor.set_width(size.width.0 as u64);
+        resolve_descriptor.set_height(size.height.0 as u64);
+        resolve_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        resolve_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        resolve_descriptor
             .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        let intermediate = self.device.new_texture(&descriptor);
+        let intermediate = self.device.new_texture(&resolve_descriptor);
+
         let msaa = if self.path_sample_count > 1 {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(size.width.0 as u64);
+            descriptor.set_height(size.height.0 as u64);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
             descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
             descriptor.set_sample_count(self.path_sample_count as u64);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            descriptor.set_storage_mode(
+                if self.device.supports_family(metal::MTLGPUFamily::Apple1) {
+                    metal::MTLStorageMode::Memoryless
+                } else {
+                    metal::MTLStorageMode::Private
+                },
+            );
             Some(self.device.new_texture(&descriptor))
         } else {
             None
