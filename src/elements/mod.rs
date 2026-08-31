@@ -11,6 +11,7 @@ mod surface;
 mod svg;
 mod text;
 mod uniform_list;
+mod vector_scene_cache;
 
 pub use anchored::*;
 pub use animation::*;
@@ -25,3 +26,4 @@ pub use surface::*;
 pub use svg::*;
 pub use text::*;
 pub use uniform_list::*;
+pub use vector_scene_cache::*;

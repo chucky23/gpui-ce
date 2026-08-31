@@ -137,6 +137,37 @@ impl Scene {
         }
     }
 
+    pub(crate) fn clone_vector_paint(&self, range: Range<usize>) -> Option<Vec<PaintOperation>> {
+        self.paint_operations[range]
+            .iter()
+            .map(|operation| match operation {
+                PaintOperation::Primitive(Primitive::Surface(_))
+                | PaintOperation::Primitive(Primitive::RasterTile(_)) => None,
+                _ => Some(operation.clone()),
+            })
+            .collect()
+    }
+
+    pub(crate) fn replay_vector_translation(
+        &mut self,
+        operations: &[PaintOperation],
+        translation: Point<ScaledPixels>,
+    ) {
+        for operation in operations {
+            match operation {
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_primitive(primitive.translated(translation));
+                }
+                PaintOperation::StartLayer(bounds) => {
+                    let mut bounds = *bounds;
+                    bounds.origin += translation;
+                    self.push_layer(bounds);
+                }
+                PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+    }
+
     pub(crate) fn clone_text_paint(&self, range: Range<usize>) -> Option<Vec<PaintOperation>> {
         self.paint_operations[range]
             .iter()
@@ -318,6 +349,85 @@ impl Primitive {
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
             Primitive::RasterTile(tile) => &tile.content_mask,
+        }
+    }
+
+    fn translated(&self, translation: Point<ScaledPixels>) -> Self {
+        let translate_mask = |mask: &ContentMask<ScaledPixels>| {
+            let mut mask = mask.clone();
+            mask.bounds.origin += translation;
+            mask
+        };
+        let conjugate = |matrix: TransformationMatrix| {
+            let inverse_translation = Point::new(
+                ScaledPixels(-translation.x.0),
+                ScaledPixels(-translation.y.0),
+            );
+            TransformationMatrix::unit()
+                .translate(translation)
+                .compose(matrix)
+                .translate(inverse_translation)
+        };
+
+        match self {
+            Primitive::Shadow(template) => {
+                let mut shadow = template.clone();
+                shadow.bounds.origin += translation;
+                shadow.content_mask = translate_mask(&shadow.content_mask);
+                shadow.transformation = conjugate(shadow.transformation);
+                Primitive::Shadow(shadow)
+            }
+            Primitive::Quad(template) => {
+                let mut quad = template.clone();
+                quad.bounds.origin += translation;
+                quad.content_mask = translate_mask(&quad.content_mask);
+                quad.transformation = conjugate(quad.transformation);
+                Primitive::Quad(quad)
+            }
+            Primitive::Path(template) => {
+                let mut path = template.clone();
+                path.bounds.origin += translation;
+                path.content_mask = translate_mask(&path.content_mask);
+                path.start += translation;
+                path.current += translation;
+                for vertex in &mut path.vertices {
+                    vertex.xy_position += translation;
+                    vertex.content_mask = translate_mask(&vertex.content_mask);
+                }
+                Primitive::Path(path)
+            }
+            Primitive::Underline(template) => {
+                let mut underline = template.clone();
+                underline.bounds.origin += translation;
+                underline.content_mask = translate_mask(&underline.content_mask);
+                Primitive::Underline(underline)
+            }
+            Primitive::MonochromeSprite(template) => {
+                let mut sprite = template.clone();
+                sprite.bounds.origin += translation;
+                sprite.content_mask = translate_mask(&sprite.content_mask);
+                sprite.transformation = conjugate(sprite.transformation);
+                Primitive::MonochromeSprite(sprite)
+            }
+            Primitive::PolychromeSprite(template) => {
+                let mut sprite = template.clone();
+                sprite.bounds.origin += translation;
+                sprite.content_mask = translate_mask(&sprite.content_mask);
+                sprite.transformation = conjugate(sprite.transformation);
+                Primitive::PolychromeSprite(sprite)
+            }
+            Primitive::Surface(template) => {
+                let mut surface = template.clone();
+                surface.bounds.origin += translation;
+                surface.content_mask = translate_mask(&surface.content_mask);
+                Primitive::Surface(surface)
+            }
+            Primitive::RasterTile(template) => {
+                let mut tile = template.clone();
+                tile.bounds.origin += translation;
+                tile.content_mask = translate_mask(&tile.content_mask);
+                Primitive::RasterTile(tile)
+            }
         }
     }
 }
@@ -999,5 +1109,113 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::px;
+
+    fn scaled_point(x: f32, y: f32) -> Point<ScaledPixels> {
+        Point::new(ScaledPixels(x), ScaledPixels(y))
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            scaled_point(x, y),
+            Size::new(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    #[test]
+    fn vector_translation_moves_bounds_masks_and_existing_transformation_together() {
+        let bounds = scaled_bounds(10., 20., 30., 40.);
+        let content_mask = ContentMask {
+            bounds: scaled_bounds(0., 0., 100., 100.),
+        };
+        let transformation = TransformationMatrix::unit()
+            .translate(scaled_point(10., 20.))
+            .scale(Size::new(2., 2.))
+            .translate(scaled_point(-10., -20.));
+        let mut original = Scene::default();
+        original.insert_primitive(Quad {
+            bounds,
+            content_mask,
+            transformation,
+            ..Default::default()
+        });
+        let Some(operations) = original.clone_vector_paint(0..original.len()) else {
+            panic!("quad must be supported");
+        };
+
+        let translation = scaled_point(7., -3.);
+        let mut replayed = Scene::default();
+        replayed.replay_vector_translation(&operations, translation);
+        let translated = &replayed.quads[0];
+
+        assert_eq!(translated.bounds.origin, scaled_point(17., 17.));
+        assert_eq!(translated.content_mask.bounds.origin, scaled_point(7., -3.));
+        let old_output = transformation.apply(point(px(12.), px(22.)));
+        let new_output = translated.transformation.apply(point(px(19.), px(19.)));
+        assert_eq!(new_output, old_output + point(px(7.), px(-3.)));
+    }
+
+    #[test]
+    fn vector_translation_moves_every_path_coordinate() {
+        let mask = ContentMask {
+            bounds: scaled_bounds(0., 0., 100., 100.),
+        };
+        let path = Path {
+            id: PathId(0),
+            order: 0,
+            bounds: scaled_bounds(2., 3., 8., 9.),
+            content_mask: mask.clone(),
+            vertices: vec![PathVertex {
+                xy_position: scaled_point(4., 5.),
+                st_position: point(0., 1.),
+                content_mask: mask,
+            }],
+            color: Background::default(),
+            start: scaled_point(2., 3.),
+            current: scaled_point(10., 12.),
+            contour_count: 1,
+        };
+        let mut original = Scene::default();
+        original.insert_primitive(path);
+        let Some(operations) = original.clone_vector_paint(0..original.len()) else {
+            panic!("path must be supported");
+        };
+
+        let mut replayed = Scene::default();
+        replayed.replay_vector_translation(&operations, scaled_point(-2., 6.));
+        let translated = &replayed.paths[0];
+
+        assert_eq!(translated.bounds.origin, scaled_point(0., 9.));
+        assert_eq!(translated.start, scaled_point(0., 9.));
+        assert_eq!(translated.current, scaled_point(8., 18.));
+        assert_eq!(translated.vertices[0].xy_position, scaled_point(2., 11.));
+        assert_eq!(
+            translated.vertices[0].content_mask.bounds.origin,
+            scaled_point(-2., 6.)
+        );
+    }
+
+    #[test]
+    fn vector_capture_rejects_raster_tiles_atomically() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(RasterTile {
+            order: 0,
+            bounds: scaled_bounds(0., 0., 10., 10.),
+            content_mask: ContentMask {
+                bounds: scaled_bounds(0., 0., 10., 10.),
+            },
+            cache_id: 1,
+            key: 2,
+            revision: 3,
+            gutter: 0,
+        });
+
+        assert!(scene.clone_vector_paint(0..scene.len()).is_none());
     }
 }
