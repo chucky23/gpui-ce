@@ -89,6 +89,54 @@ pub struct VectorSceneCacheStats {
     pub primitive_count: usize,
 }
 
+/// Преобразование камеры, с которым была построена либо должна быть показана сцена.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorSceneTransform {
+    /// Равномерный масштаб относительно координат подробной сцены.
+    pub scale: f32,
+    /// Перенос после применения масштаба.
+    pub translation: Point<Pixels>,
+}
+
+impl VectorSceneTransform {
+    /// Создаёт преобразование камеры; допустимость проверяется перед повторением.
+    pub fn new(scale: f32, translation: Point<Pixels>) -> Self {
+        Self { scale, translation }
+    }
+
+    fn is_valid(self) -> bool {
+        self.scale.is_finite()
+            && self.scale > 0.0
+            && self.translation.x.0.is_finite()
+            && self.translation.y.0.is_finite()
+    }
+
+    fn relative_to(self, captured: Self) -> Option<(f32, Point<Pixels>)> {
+        if !self.is_valid() || !captured.is_valid() {
+            return None;
+        }
+        let scale = self.scale / captured.scale;
+        let translation = Point::new(
+            self.translation.x - captured.translation.x * scale,
+            self.translation.y - captured.translation.y * scale,
+        );
+        (scale.is_finite()
+            && scale > 0.0
+            && translation.x.0.is_finite()
+            && translation.y.0.is_finite())
+        .then_some((scale, translation))
+    }
+}
+
+impl Default for VectorSceneTransform {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            translation: Point::default(),
+        }
+    }
+}
+
 /// Повторяет ранее захваченные векторные операции с новым переносом камеры.
 ///
 /// При изменении `revision`, выходе `viewport` за `coverage` или наличии
@@ -101,24 +149,47 @@ pub fn cached_vector_scene_translation(
     translation: Point<Pixels>,
     child: impl IntoElement,
 ) -> CachedVectorSceneTranslation {
+    cached_vector_scene_transform(
+        handle,
+        revision,
+        coverage,
+        viewport,
+        VectorSceneTransform::new(1.0, translation),
+        child,
+    )
+}
+
+/// Повторяет ранее захваченные векторные операции с новым масштабом и переносом камеры.
+///
+/// При изменении `revision`, выходе `viewport` за `coverage`, недопустимом
+/// преобразовании или наличии неподдерживаемого примитива подробный `child`
+/// строится синхронно в том же кадре.
+pub fn cached_vector_scene_transform(
+    handle: VectorSceneCacheHandle,
+    revision: VectorSceneRevision,
+    coverage: VectorSceneCoverage,
+    viewport: Bounds<Pixels>,
+    transform: VectorSceneTransform,
+    child: impl IntoElement,
+) -> CachedVectorSceneTranslation {
     CachedVectorSceneTranslation {
         handle,
         revision,
         coverage,
         viewport,
-        translation,
+        transform,
         child: Some(child.into_any_element()),
         style: StyleRefinement::default(),
     }
 }
 
-/// Граница элемента для повторения векторной сцены при переносе.
+/// Граница элемента для повторения векторной сцены при преобразовании камеры.
 pub struct CachedVectorSceneTranslation {
     handle: VectorSceneCacheHandle,
     revision: VectorSceneRevision,
     coverage: VectorSceneCoverage,
     viewport: Bounds<Pixels>,
-    translation: Point<Pixels>,
+    transform: VectorSceneTransform,
     child: Option<AnyElement>,
     style: StyleRefinement,
 }
@@ -126,7 +197,7 @@ pub struct CachedVectorSceneTranslation {
 struct VectorSceneState {
     revision: VectorSceneRevision,
     coverage: VectorSceneCoverage,
-    captured_translation: Point<Pixels>,
+    captured_transform: VectorSceneTransform,
     scale_factor_bits: u32,
     operations: Vec<PaintOperation>,
     ready: bool,
@@ -137,7 +208,7 @@ impl Default for VectorSceneState {
         Self {
             revision: VectorSceneRevision::default(),
             coverage: VectorSceneCoverage::default(),
-            captured_translation: Point::default(),
+            captured_transform: VectorSceneTransform::default(),
             scale_factor_bits: 0,
             operations: Vec::new(),
             ready: false,
@@ -148,6 +219,8 @@ impl Default for VectorSceneState {
 /// Внутреннее состояние одного prepaint-прохода кэшируемой сцены.
 pub struct VectorScenePrepaintState {
     hit: bool,
+    relative_scale: f32,
+    relative_translation: Point<Pixels>,
     child: Option<AnyElement>,
     prepaint_safe: bool,
     cache_id_available: bool,
@@ -198,20 +271,24 @@ impl Element for CachedVectorSceneTranslation {
         cx: &mut App,
     ) -> VectorScenePrepaintState {
         let scale_factor_bits = window.scale_factor().to_bits();
-        let hit = id.is_some_and(|id| {
+        let relative_transform = id.and_then(|id| {
             window.with_element_state::<VectorSceneState, _>(id, |state, _window| {
                 let state = state.unwrap_or_default();
-                let hit = state.ready
+                let relative = (state.ready
                     && state.revision == self.revision
                     && state.scale_factor_bits == scale_factor_bits
-                    && state.coverage.contains(self.viewport);
-                (hit, state)
+                    && state.coverage.contains(self.viewport))
+                .then(|| self.transform.relative_to(state.captured_transform))
+                .flatten();
+                (relative, state)
             })
         });
-        if hit {
+        if let Some((relative_scale, relative_translation)) = relative_transform {
             self.handle.inner.hits.fetch_add(1, Ordering::Relaxed);
             return VectorScenePrepaintState {
                 hit: true,
+                relative_scale,
+                relative_translation,
                 child: None,
                 prepaint_safe: true,
                 cache_id_available: true,
@@ -228,6 +305,8 @@ impl Element for CachedVectorSceneTranslation {
         }
         VectorScenePrepaintState {
             hit: false,
+            relative_scale: 1.0,
+            relative_translation: Point::default(),
             child,
             prepaint_safe: hitboxes_before == window.next_frame.hitboxes.len()
                 && deferred_before == window.next_frame.deferred_draws.len(),
@@ -250,16 +329,19 @@ impl Element for CachedVectorSceneTranslation {
                 return;
             };
             let scale_factor = window.scale_factor();
+            let relative_scale = prepaint.relative_scale;
+            let relative_translation = prepaint.relative_translation;
             window.with_element_state::<VectorSceneState, _>(id, |state, window| {
                 let state = state.unwrap_or_default();
-                let delta = Point::new(
-                    (self.translation.x - state.captured_translation.x).scale(scale_factor),
-                    (self.translation.y - state.captured_translation.y).scale(scale_factor),
+                let translation = Point::new(
+                    relative_translation.x.scale(scale_factor),
+                    relative_translation.y.scale(scale_factor),
                 );
-                window
-                    .next_frame
-                    .scene
-                    .replay_vector_translation(&state.operations, delta);
+                window.next_frame.scene.replay_vector_transform(
+                    &state.operations,
+                    relative_scale,
+                    translation,
+                );
                 ((), state)
             });
             return;
@@ -288,7 +370,8 @@ impl Element for CachedVectorSceneTranslation {
                     && input_handlers_before == window.next_frame.input_handlers.len()
                     && cursor_styles_before == window.next_frame.cursor_styles.len()
             });
-        let supported = prepaint.cache_id_available && operations.is_some();
+        let supported =
+            prepaint.cache_id_available && self.transform.is_valid() && operations.is_some();
         let operation_count = operations.as_ref().map_or(0, Vec::len);
         if !supported {
             self.handle
@@ -308,7 +391,7 @@ impl Element for CachedVectorSceneTranslation {
             let mut state = state.unwrap_or_default();
             state.revision = self.revision;
             state.coverage = self.coverage;
-            state.captured_translation = self.translation;
+            state.captured_transform = self.transform;
             state.scale_factor_bits = scale_factor_bits;
             state.operations = operations.unwrap_or_default();
             state.ready = supported;
@@ -327,7 +410,7 @@ impl Styled for CachedVectorSceneTranslation {
 mod tests {
     use crate::{bounds, point, px, size};
 
-    use super::VectorSceneCoverage;
+    use super::{VectorSceneCoverage, VectorSceneTransform};
 
     #[test]
     fn coverage_uses_inclusive_outer_edges() {
@@ -335,5 +418,31 @@ mod tests {
             VectorSceneCoverage(bounds(point(px(-100.), px(-50.)), size(px(300.), px(200.))));
         assert!(coverage.contains(bounds(point(px(-100.), px(-50.)), size(px(300.), px(200.)),)));
         assert!(!coverage.contains(bounds(point(px(-101.), px(-50.)), size(px(300.), px(200.)),)));
+    }
+
+    #[test]
+    fn relative_transform_maps_captured_screen_coordinates_to_current_ones() {
+        let captured = VectorSceneTransform::new(0.5, point(px(20.), px(-10.)));
+        let current = VectorSceneTransform::new(0.8, point(px(-5.), px(30.)));
+        let (scale, translation) = current.relative_to(captured).expect("valid transform");
+
+        assert!((scale - 1.6).abs() < f32::EPSILON);
+        assert!((translation.x.0 + 37.0).abs() < f32::EPSILON);
+        assert!((translation.y.0 - 46.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn invalid_transform_cannot_be_replayed() {
+        let valid = VectorSceneTransform::default();
+        assert!(
+            VectorSceneTransform::new(0.0, point(px(0.), px(0.)))
+                .relative_to(valid)
+                .is_none()
+        );
+        assert!(
+            VectorSceneTransform::new(1.0, point(px(f32::NAN), px(0.)))
+                .relative_to(valid)
+                .is_none()
+        );
     }
 }
