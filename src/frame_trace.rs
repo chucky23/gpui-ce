@@ -580,12 +580,12 @@ pub(crate) fn invalidate_display_link_context() {
 }
 
 /// Returns the latest main-thread DisplayLink target in host-time nanoseconds.
-pub(crate) fn latest_display_target_ns() -> u64 {
+pub fn latest_display_target_ns() -> u64 {
     LATEST_DISPLAY_TARGET_NS.load(Ordering::Acquire)
 }
 
 /// Returns the latest main-thread DisplayLink sequence.
-pub(crate) fn latest_display_tick_sequence() -> u64 {
+pub fn latest_display_tick_sequence() -> u64 {
     LATEST_DISPLAY_TICK_SEQUENCE.load(Ordering::Acquire)
 }
 
