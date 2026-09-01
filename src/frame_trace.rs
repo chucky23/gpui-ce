@@ -88,6 +88,8 @@ pub enum FrameTraceEventKind {
     CanvasRenderCompleted,
     /// GPUI began prepainting the full window tree.
     WindowPrepaintStarted,
+    /// GPUI began prepainting the Canvas root element.
+    CanvasPrepaintStarted,
     /// GPUI completed prepainting the Canvas root element.
     CanvasPrepaintCompleted,
     /// GPUI completed prepainting the full window tree.
