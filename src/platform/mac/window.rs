@@ -2289,6 +2289,8 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 
     let scale_factor = lock.scale_factor();
     let drawable_size = new_size.to_device_pixels(scale_factor);
+    #[cfg(not(feature = "macos-blade"))]
+    lock.renderer.set_display_link_target(None);
     lock.renderer.update_drawable_size(drawable_size);
 
     if let Some(mut callback) = lock.resize_callback.take() {
@@ -2304,6 +2306,8 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
+        #[cfg(not(feature = "macos-blade"))]
+        lock.renderer.set_display_link_target(None);
         #[cfg(not(feature = "macos-blade"))]
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
@@ -2325,24 +2329,28 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
+    let display_link_delivery = lock
+        .display_link
+        .as_mut()
+        .and_then(DisplayLink::take_delivery);
+    #[cfg(not(feature = "macos-blade"))]
+    lock.renderer.set_display_link_target(
+        display_link_delivery
+            .as_ref()
+            .filter(|delivery| delivery.target_valid)
+            .map(|delivery| delivery.target_host_time),
+    );
+
     #[cfg(feature = "frame-trace")]
     {
-        if let Some((
-            callback_host_time,
-            target_host_time,
-            tick_sequence,
-            coalesced_tick_count,
-            target_valid,
-        )) = lock
-            .display_link
-            .as_mut()
-            .and_then(DisplayLink::take_trace_delivery)
-        {
-            let callback_time_ns = crate::frame_trace::mach_ticks_to_ns(callback_host_time);
-            let target_display_time_ns = target_valid
-                .then(|| crate::frame_trace::mach_ticks_to_ns(target_host_time))
+        if let Some(delivery) = display_link_delivery.as_ref() {
+            let callback_time_ns =
+                crate::frame_trace::mach_ticks_to_ns(delivery.callback_host_time);
+            let target_display_time_ns = delivery
+                .target_valid
+                .then(|| crate::frame_trace::mach_ticks_to_ns(delivery.target_host_time))
                 .unwrap_or_default();
-            let flags = if target_valid {
+            let flags = if delivery.target_valid {
                 0
             } else {
                 crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
@@ -2350,8 +2358,8 @@ unsafe extern "C" fn step(view: *mut c_void) {
             crate::frame_trace::record_display_link_delivery(
                 callback_time_ns,
                 target_display_time_ns,
-                tick_sequence,
-                coalesced_tick_count,
+                delivery.tick_sequence_id,
+                delivery.coalesced_tick_count,
                 flags,
             );
         } else {
@@ -2367,6 +2375,8 @@ unsafe extern "C" fn step(view: *mut c_void) {
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }
+    #[cfg(not(feature = "macos-blade"))]
+    window_state.lock().renderer.set_display_link_target(None);
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {
