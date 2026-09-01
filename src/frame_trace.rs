@@ -78,7 +78,10 @@ pub enum FrameTraceEventKind {
     EntityNotified,
     /// GPUI received a request to mark a window or one of its views dirty.
     WindowInvalidated,
-    /// The main-thread DisplayLink dispatch source delivered one or more ticks.
+    /// The latest CVDisplayLink callback represented by a main-thread delivery.
+    ///
+    /// `timestamp_ns` is the worker callback time and `callback_observed_ns` is
+    /// the main-queue delivery time.
     DisplayLinkDelivered,
     /// GPUI began rebuilding a dirty logical window frame.
     LogicalFrameStarted,
@@ -558,8 +561,9 @@ pub(crate) fn next_display_tick_sequence_id() -> u64 {
     NEXT_DISPLAY_TICK_SEQUENCE_ID.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// Updates and records the latest DisplayLink target delivered on the main thread.
+/// Updates and records the latest DisplayLink callback delivered on the main thread.
 pub(crate) fn record_display_link_delivery(
+    callback_time_ns: u64,
     target_display_time_ns: u64,
     display_tick_sequence: u64,
     coalesced_tick_count: u64,
@@ -568,6 +572,8 @@ pub(crate) fn record_display_link_delivery(
     LATEST_DISPLAY_TARGET_NS.store(target_display_time_ns, Ordering::Release);
     LATEST_DISPLAY_TICK_SEQUENCE.store(display_tick_sequence, Ordering::Release);
     let mut event = FrameTraceEvent::now(FrameTraceEventKind::DisplayLinkDelivered);
+    event.callback_observed_ns = event.timestamp_ns;
+    event.timestamp_ns = callback_time_ns;
     event.target_display_time_ns = target_display_time_ns;
     event.display_tick_sequence = display_tick_sequence;
     event.coalesced_display_tick_count = coalesced_tick_count;

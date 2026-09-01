@@ -2324,11 +2324,18 @@ unsafe extern "C" fn step(view: *mut c_void) {
 
     #[cfg(feature = "frame-trace")]
     {
-        if let Some((target_host_time, tick_sequence, coalesced_tick_count, target_valid)) = lock
+        if let Some((
+            callback_host_time,
+            target_host_time,
+            tick_sequence,
+            coalesced_tick_count,
+            target_valid,
+        )) = lock
             .display_link
             .as_mut()
             .and_then(DisplayLink::take_trace_delivery)
         {
+            let callback_time_ns = crate::frame_trace::mach_ticks_to_ns(callback_host_time);
             let target_display_time_ns = target_valid
                 .then(|| crate::frame_trace::mach_ticks_to_ns(target_host_time))
                 .unwrap_or_default();
@@ -2338,6 +2345,7 @@ unsafe extern "C" fn step(view: *mut c_void) {
                 crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
             };
             crate::frame_trace::record_display_link_delivery(
+                callback_time_ns,
                 target_display_time_ns,
                 tick_sequence,
                 coalesced_tick_count,

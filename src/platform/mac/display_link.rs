@@ -17,6 +17,7 @@ use util::ResultExt;
 struct DisplayLinkCallbackState {
     frame_requests: dispatch_source_t,
     snapshot_version: AtomicU64,
+    latest_callback_host_time: AtomicU64,
     latest_target_host_time: AtomicU64,
     latest_target_valid: AtomicBool,
     latest_tick_sequence_id: AtomicU64,
@@ -51,12 +52,17 @@ impl DisplayLink {
                 let frame_requests = {
                     let state = &*(frame_requests as *const DisplayLinkCallbackState);
                     let output_time = _output_time.as_ref();
+                    // SAFETY: mach_absolute_time has no preconditions.
+                    let callback_host_time = mach2::mach_time::mach_absolute_time();
                     let target_valid = output_time
                         .is_some_and(|time| time.flags & sys::kCVTimeStampHostTimeValid != 0);
                     let target_host_time = output_time.map_or(0, |time| time.host_time);
                     // CoreVideo invokes one DisplayLink's output callback serially. This
                     // single-writer seqlock publishes a coherent payload to the main thread.
                     state.snapshot_version.fetch_add(1, Ordering::SeqCst);
+                    state
+                        .latest_callback_host_time
+                        .store(callback_host_time, Ordering::SeqCst);
                     state
                         .latest_target_host_time
                         .store(target_host_time, Ordering::SeqCst);
@@ -99,6 +105,7 @@ impl DisplayLink {
             let callback_state = Box::leak(Box::new(DisplayLinkCallbackState {
                 frame_requests,
                 snapshot_version: AtomicU64::new(0),
+                latest_callback_host_time: AtomicU64::new(0),
                 latest_target_host_time: AtomicU64::new(0),
                 latest_target_valid: AtomicBool::new(false),
                 latest_tick_sequence_id: AtomicU64::new(0),
@@ -144,11 +151,15 @@ impl DisplayLink {
     }
 
     #[cfg(feature = "frame-trace")]
-    pub(crate) fn take_trace_delivery(&mut self) -> Option<(u64, u64, u64, bool)> {
+    pub(crate) fn take_trace_delivery(&mut self) -> Option<(u64, u64, u64, u64, bool)> {
         let version_before = self.callback_state.snapshot_version.load(Ordering::SeqCst);
         if version_before & 1 != 0 {
             return None;
         }
+        let callback_host_time = self
+            .callback_state
+            .latest_callback_host_time
+            .load(Ordering::SeqCst);
         let target_host_time = self
             .callback_state
             .latest_target_host_time
@@ -173,6 +184,7 @@ impl DisplayLink {
             callback_count.saturating_sub(self.last_delivered_callback_count);
         self.last_delivered_callback_count = callback_count;
         Some((
+            callback_host_time,
             target_host_time,
             tick_sequence_id,
             coalesced_tick_count,
