@@ -37,7 +37,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     mem, ptr,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -54,63 +54,6 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-const MAX_DISPLAY_LINK_TARGET_LEAD: f64 = 0.050;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MetalPresentationMode {
-    Asap,
-    DisplayLinkTarget,
-}
-
-fn parse_metal_presentation_mode(value: Option<&str>) -> MetalPresentationMode {
-    match value {
-        Some("display-link-target") => MetalPresentationMode::DisplayLinkTarget,
-        Some("asap") | None => MetalPresentationMode::Asap,
-        Some(value) => {
-            log::error!(
-                "unknown GPUI_METAL_PRESENTATION_MODE value {value:?}; falling back to asap"
-            );
-            MetalPresentationMode::Asap
-        }
-    }
-}
-
-fn metal_presentation_mode() -> MetalPresentationMode {
-    static MODE: OnceLock<MetalPresentationMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        parse_metal_presentation_mode(
-            std::env::var("GPUI_METAL_PRESENTATION_MODE")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-fn mach_host_time_seconds(host_time: u64) -> Option<f64> {
-    use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
-
-    static TIMEBASE: OnceLock<Option<mach_timebase_info_data_t>> = OnceLock::new();
-    let timebase = TIMEBASE
-        .get_or_init(|| {
-            let mut timebase = mach_timebase_info_data_t { numer: 0, denom: 0 };
-            // SAFETY: timebase is a valid out pointer for mach_timebase_info.
-            let result = unsafe { mach_timebase_info(&mut timebase) };
-            (result == 0 && timebase.denom != 0).then_some(timebase)
-        })
-        .as_ref()?;
-    Some(host_time as f64 * f64::from(timebase.numer) / f64::from(timebase.denom) / 1_000_000_000.)
-}
-
-fn valid_display_link_target_seconds(target_host_time: u64, now_host_time: u64) -> Option<f64> {
-    let target = mach_host_time_seconds(target_host_time)?;
-    let now = mach_host_time_seconds(now_host_time)?;
-    valid_target_seconds(target, now)
-}
-
-fn valid_target_seconds(target: f64, now: f64) -> Option<f64> {
-    let lead = target - now;
-    (lead > 0. && lead <= MAX_DISPLAY_LINK_TARGET_LEAD).then_some(target)
-}
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -455,8 +398,6 @@ pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: metal::MetalLayer,
     presents_with_transaction: bool,
-    presentation_mode: MetalPresentationMode,
-    display_link_target_host_time: Option<u64>,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -718,8 +659,6 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
-            presentation_mode: metal_presentation_mode(),
-            display_link_target_host_time: None,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -887,15 +826,8 @@ impl MetalRenderer {
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
-        if presents_with_transaction {
-            self.display_link_target_host_time = None;
-        }
         self.layer
             .set_presents_with_transaction(presents_with_transaction);
-    }
-
-    pub fn set_display_link_target(&mut self, target_host_time: Option<u64>) {
-        self.display_link_target_host_time = target_host_time;
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -1061,7 +993,6 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        let display_link_target_host_time = self.display_link_target_host_time.take();
         {
             const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
             let required = required_instance_buffer_size(scene);
@@ -1321,27 +1252,7 @@ impl MetalRenderer {
                         command_buffer.wait_until_scheduled();
                         drawable.present();
                     } else {
-                        let display_link_target_seconds = (self.presentation_mode
-                            == MetalPresentationMode::DisplayLinkTarget)
-                            .then_some(display_link_target_host_time)
-                            .flatten()
-                            .and_then(|target_host_time| {
-                                // SAFETY: mach_absolute_time has no preconditions.
-                                let now_host_time =
-                                    unsafe { mach2::mach_time::mach_absolute_time() };
-                                valid_display_link_target_seconds(target_host_time, now_host_time)
-                            });
-                        if let Some(target_seconds) = display_link_target_seconds {
-                            unsafe {
-                                let _: () = msg_send![
-                                    command_buffer.as_ref(),
-                                    presentDrawable: drawable
-                                    atTime: target_seconds
-                                ];
-                            }
-                        } else {
-                            command_buffer.present_drawable(drawable);
-                        }
+                        command_buffer.present_drawable(drawable);
                         #[cfg(feature = "frame-trace")]
                         let submitted_event = prepare_submission_event();
                         command_buffer.commit();
@@ -2899,43 +2810,6 @@ impl MetalRenderer {
             *instance_offset = next_offset;
         }
         true
-    }
-}
-
-#[cfg(test)]
-mod presentation_mode_tests {
-    use super::{MetalPresentationMode, parse_metal_presentation_mode, valid_target_seconds};
-
-    #[test]
-    fn presentation_mode_defaults_to_asap() {
-        assert_eq!(
-            parse_metal_presentation_mode(None),
-            MetalPresentationMode::Asap
-        );
-    }
-
-    #[test]
-    fn presentation_mode_accepts_closed_values() {
-        assert_eq!(
-            parse_metal_presentation_mode(Some("asap")),
-            MetalPresentationMode::Asap
-        );
-        assert_eq!(
-            parse_metal_presentation_mode(Some("display-link-target")),
-            MetalPresentationMode::DisplayLinkTarget
-        );
-        assert_eq!(
-            parse_metal_presentation_mode(Some("unexpected")),
-            MetalPresentationMode::Asap
-        );
-    }
-
-    #[test]
-    fn display_link_target_must_be_near_and_in_the_future() {
-        assert_eq!(valid_target_seconds(10.016, 10.), Some(10.016));
-        assert_eq!(valid_target_seconds(10., 10.), None);
-        assert_eq!(valid_target_seconds(9.999, 10.), None);
-        assert_eq!(valid_target_seconds(10.051, 10.), None);
     }
 }
 

@@ -9,36 +9,27 @@ use crate::{
 use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use std::ffi::c_void;
+#[cfg(feature = "frame-trace")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use util::ResultExt;
 
+#[cfg(feature = "frame-trace")]
 struct DisplayLinkCallbackState {
     frame_requests: dispatch_source_t,
     snapshot_version: AtomicU64,
+    latest_callback_host_time: AtomicU64,
     latest_target_host_time: AtomicU64,
     latest_target_valid: AtomicBool,
-    callback_count: AtomicU64,
-    #[cfg(feature = "frame-trace")]
-    latest_callback_host_time: AtomicU64,
-    #[cfg(feature = "frame-trace")]
     latest_tick_sequence_id: AtomicU64,
-}
-
-pub(crate) struct DisplayLinkDelivery {
-    pub(crate) target_host_time: u64,
-    pub(crate) target_valid: bool,
-    #[cfg(feature = "frame-trace")]
-    pub(crate) callback_host_time: u64,
-    #[cfg(feature = "frame-trace")]
-    pub(crate) tick_sequence_id: u64,
-    #[cfg(feature = "frame-trace")]
-    pub(crate) coalesced_tick_count: u64,
+    callback_count: AtomicU64,
 }
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: dispatch_source_t,
+    #[cfg(feature = "frame-trace")]
     callback_state: &'static DisplayLinkCallbackState,
+    #[cfg(feature = "frame-trace")]
     last_delivered_callback_count: u64,
 }
 
@@ -57,9 +48,12 @@ impl DisplayLink {
             frame_requests: *mut c_void,
         ) -> i32 {
             unsafe {
+                #[cfg(feature = "frame-trace")]
                 let frame_requests = {
                     let state = &*(frame_requests as *const DisplayLinkCallbackState);
                     let output_time = _output_time.as_ref();
+                    // SAFETY: mach_absolute_time has no preconditions.
+                    let callback_host_time = mach2::mach_time::mach_absolute_time();
                     let target_valid = output_time
                         .is_some_and(|time| time.flags & sys::kCVTimeStampHostTimeValid != 0);
                     let target_host_time = output_time.map_or(0, |time| time.host_time);
@@ -67,27 +61,24 @@ impl DisplayLink {
                     // single-writer seqlock publishes a coherent payload to the main thread.
                     state.snapshot_version.fetch_add(1, Ordering::SeqCst);
                     state
+                        .latest_callback_host_time
+                        .store(callback_host_time, Ordering::SeqCst);
+                    state
                         .latest_target_host_time
                         .store(target_host_time, Ordering::SeqCst);
                     state
                         .latest_target_valid
                         .store(target_valid, Ordering::SeqCst);
-                    #[cfg(feature = "frame-trace")]
-                    {
-                        // SAFETY: mach_absolute_time has no preconditions.
-                        let callback_host_time = mach2::mach_time::mach_absolute_time();
-                        state
-                            .latest_callback_host_time
-                            .store(callback_host_time, Ordering::SeqCst);
-                        state.latest_tick_sequence_id.store(
-                            crate::frame_trace::next_display_tick_sequence_id(),
-                            Ordering::SeqCst,
-                        );
-                    }
+                    state.latest_tick_sequence_id.store(
+                        crate::frame_trace::next_display_tick_sequence_id(),
+                        Ordering::SeqCst,
+                    );
                     state.callback_count.fetch_add(1, Ordering::SeqCst);
                     state.snapshot_version.fetch_add(1, Ordering::SeqCst);
                     state.frame_requests
                 };
+                #[cfg(not(feature = "frame-trace"))]
+                let frame_requests = frame_requests as dispatch_source_t;
                 dispatch_source_merge_data(frame_requests, 1);
                 0
             }
@@ -108,20 +99,22 @@ impl DisplayLink {
             );
             dispatch_source_set_event_handler_f(frame_requests, Some(callback));
 
+            #[cfg(feature = "frame-trace")]
             // DisplayLink itself is intentionally leaked on drop because CoreVideo may still
             // access it from its worker thread. Its callback context must have the same lifetime.
             let callback_state = Box::leak(Box::new(DisplayLinkCallbackState {
                 frame_requests,
                 snapshot_version: AtomicU64::new(0),
+                latest_callback_host_time: AtomicU64::new(0),
                 latest_target_host_time: AtomicU64::new(0),
                 latest_target_valid: AtomicBool::new(false),
-                callback_count: AtomicU64::new(0),
-                #[cfg(feature = "frame-trace")]
-                latest_callback_host_time: AtomicU64::new(0),
-                #[cfg(feature = "frame-trace")]
                 latest_tick_sequence_id: AtomicU64::new(0),
+                callback_count: AtomicU64::new(0),
             }));
+            #[cfg(feature = "frame-trace")]
             let display_link_context = callback_state as *const _ as *mut c_void;
+            #[cfg(not(feature = "frame-trace"))]
+            let display_link_context = frame_requests as *mut c_void;
 
             let display_link =
                 sys::DisplayLink::new(display_id, display_link_callback, display_link_context)?;
@@ -129,7 +122,9 @@ impl DisplayLink {
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
+                #[cfg(feature = "frame-trace")]
                 callback_state,
+                #[cfg(feature = "frame-trace")]
                 last_delivered_callback_count: 0,
             })
         }
@@ -155,11 +150,16 @@ impl DisplayLink {
         Ok(())
     }
 
-    pub(crate) fn take_delivery(&mut self) -> Option<DisplayLinkDelivery> {
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn take_trace_delivery(&mut self) -> Option<(u64, u64, u64, u64, bool)> {
         let version_before = self.callback_state.snapshot_version.load(Ordering::SeqCst);
         if version_before & 1 != 0 {
             return None;
         }
+        let callback_host_time = self
+            .callback_state
+            .latest_callback_host_time
+            .load(Ordering::SeqCst);
         let target_host_time = self
             .callback_state
             .latest_target_host_time
@@ -168,12 +168,6 @@ impl DisplayLink {
             .callback_state
             .latest_target_valid
             .load(Ordering::SeqCst);
-        #[cfg(feature = "frame-trace")]
-        let callback_host_time = self
-            .callback_state
-            .latest_callback_host_time
-            .load(Ordering::SeqCst);
-        #[cfg(feature = "frame-trace")]
         let tick_sequence_id = self
             .callback_state
             .latest_tick_sequence_id
@@ -186,20 +180,16 @@ impl DisplayLink {
         if callback_count == self.last_delivered_callback_count {
             return None;
         }
-        #[cfg(feature = "frame-trace")]
         let coalesced_tick_count =
             callback_count.saturating_sub(self.last_delivered_callback_count);
         self.last_delivered_callback_count = callback_count;
-        Some(DisplayLinkDelivery {
-            target_host_time,
-            target_valid,
-            #[cfg(feature = "frame-trace")]
+        Some((
             callback_host_time,
-            #[cfg(feature = "frame-trace")]
+            target_host_time,
             tick_sequence_id,
-            #[cfg(feature = "frame-trace")]
             coalesced_tick_count,
-        })
+            target_valid,
+        ))
     }
 }
 
