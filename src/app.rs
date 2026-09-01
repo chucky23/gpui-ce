@@ -2116,6 +2116,14 @@ impl App {
 
     /// Tell GPUI that an entity has changed and observers of it should be notified.
     pub fn notify(&mut self, entity_id: EntityId) {
+        #[cfg(feature = "frame-trace")]
+        {
+            let mut event = crate::frame_trace::FrameTraceEvent::now(
+                crate::frame_trace::FrameTraceEventKind::EntityNotified,
+            );
+            event.input_sequence_id = crate::frame_trace::current_appkit_input_sequence_id();
+            crate::frame_trace::record(event);
+        }
         let window_invalidators = mem::take(
             self.window_invalidators_by_entity
                 .entry(entity_id)

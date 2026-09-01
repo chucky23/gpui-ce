@@ -37,6 +37,10 @@ pub(crate) struct Scene {
     pub(crate) raster_tile_updates: Vec<RasterTileUpdate>,
     pub(crate) raster_tile_update_batches: Vec<RasterTileUpdateBatch>,
     pub(crate) raster_compositor_surfaces: Vec<RasterCompositorSurface>,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_logical_frame_id: u64,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_input_sequence_id: u64,
 }
 
 impl Scene {
@@ -55,6 +59,21 @@ impl Scene {
         self.raster_tile_updates.clear();
         self.raster_tile_update_batches.clear();
         self.raster_compositor_surfaces.clear();
+        #[cfg(feature = "frame-trace")]
+        {
+            self.frame_trace_logical_frame_id = 0;
+            self.frame_trace_input_sequence_id = 0;
+        }
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn set_frame_trace_correlation(
+        &mut self,
+        logical_frame_id: u64,
+        input_sequence_id: u64,
+    ) {
+        self.frame_trace_logical_frame_id = logical_frame_id;
+        self.frame_trace_input_sequence_id = input_sequence_id;
     }
 
     pub fn len(&self) -> usize {

@@ -1269,7 +1269,19 @@ pub fn div() -> Div {
         children: SmallVec::default(),
         prepaint_listener: None,
         image_cache: None,
+        #[cfg(feature = "frame-trace")]
+        frame_trace_canvas_correlation: None,
     }
+}
+
+#[cfg(feature = "frame-trace")]
+#[derive(Clone, Copy)]
+struct FrameTraceCanvasCorrelation {
+    logical_frame_id: u64,
+    input_sequence_id: u64,
+    request_count: u64,
+    coalesced_request_count: u64,
+    dropped_request_count: u64,
 }
 
 /// A [`Div`] element, the all-in-one element for building complex UIs in GPUI
@@ -1278,9 +1290,31 @@ pub struct Div {
     children: SmallVec<[StackSafe<AnyElement>; 2]>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_canvas_correlation: Option<FrameTraceCanvasCorrelation>,
 }
 
 impl Div {
+    /// Marks this `Div` as the Canvas subtree root for frame-trace correlation.
+    #[cfg(feature = "frame-trace")]
+    pub fn frame_trace_canvas_root(
+        mut self,
+        logical_frame_id: u64,
+        input_sequence_id: u64,
+        request_count: u64,
+        coalesced_request_count: u64,
+        dropped_request_count: u64,
+    ) -> Self {
+        self.frame_trace_canvas_correlation = Some(FrameTraceCanvasCorrelation {
+            logical_frame_id,
+            input_sequence_id,
+            request_count,
+            coalesced_request_count,
+            dropped_request_count,
+        });
+        self
+    }
+
     /// Add a listener to be called when the children of this `Div` are prepainted.
     /// This allows you to store the [`Bounds`] of the children for later use.
     pub fn on_children_prepainted(
@@ -1399,6 +1433,8 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Hitbox> {
+        #[cfg(feature = "frame-trace")]
+        let frame_trace_canvas_correlation = self.frame_trace_canvas_correlation;
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -1440,7 +1476,7 @@ impl Element for Div {
             scroll_handle.scroll_to_active_item();
         }
 
-        self.interactivity.prepaint(
+        let hitbox = self.interactivity.prepaint(
             global_id,
             inspector_id,
             bounds,
@@ -1465,7 +1501,15 @@ impl Element for Div {
 
                 hitbox
             },
-        )
+        );
+        #[cfg(feature = "frame-trace")]
+        if let Some(correlation) = frame_trace_canvas_correlation {
+            record_frame_trace_canvas_event(
+                crate::frame_trace::FrameTraceEventKind::CanvasPrepaintCompleted,
+                correlation,
+            );
+        }
+        hitbox
     }
 
     #[stacksafe]
@@ -1479,6 +1523,8 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(feature = "frame-trace")]
+        let frame_trace_canvas_correlation = self.frame_trace_canvas_correlation;
         let image_cache = self
             .image_cache
             .as_mut()
@@ -1504,7 +1550,33 @@ impl Element for Div {
                 },
             )
         });
+        #[cfg(feature = "frame-trace")]
+        if let Some(correlation) = frame_trace_canvas_correlation {
+            record_frame_trace_canvas_event(
+                crate::frame_trace::FrameTraceEventKind::CanvasPaintCompleted,
+                correlation,
+            );
+        }
     }
+}
+
+#[cfg(feature = "frame-trace")]
+fn record_frame_trace_canvas_event(
+    kind: crate::frame_trace::FrameTraceEventKind,
+    correlation: FrameTraceCanvasCorrelation,
+) {
+    let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
+    event.logical_frame_id = correlation.logical_frame_id;
+    event.input_sequence_id = correlation.input_sequence_id;
+    event.request_count = correlation.request_count;
+    event.coalesced_request_count = correlation.coalesced_request_count;
+    event.dropped_request_count = correlation.dropped_request_count;
+    event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
+    event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
+    if event.target_display_time_ns == 0 {
+        event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
+    }
+    crate::frame_trace::record(event);
 }
 
 impl IntoElement for Div {

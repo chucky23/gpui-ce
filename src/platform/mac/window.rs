@@ -1474,7 +1474,24 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw(&self, scene: &crate::Scene) {
-        self.0.lock().renderer.draw(scene);
+        #[cfg(feature = "frame-trace")]
+        let record_stage = |kind| {
+            let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
+            event.logical_frame_id = scene.frame_trace_logical_frame_id;
+            event.input_sequence_id = scene.frame_trace_input_sequence_id;
+            event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
+            event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
+            if event.target_display_time_ns == 0 {
+                event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
+            }
+            crate::frame_trace::record(event);
+        };
+        #[cfg(feature = "frame-trace")]
+        record_stage(crate::frame_trace::FrameTraceEventKind::PlatformDrawRequested);
+        let mut state = self.0.lock();
+        #[cfg(feature = "frame-trace")]
+        record_stage(crate::frame_trace::FrameTraceEventKind::PlatformDrawStarted);
+        state.renderer.draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1689,6 +1706,61 @@ extern "C" fn handle_key_up(this: &Object, _: Sel, native_event: id) {
     handle_key_event(this, native_event, false);
 }
 
+#[cfg(feature = "frame-trace")]
+fn frame_trace_input_metadata(
+    event: &PlatformInput,
+) -> (
+    crate::frame_trace::FrameTraceInputKind,
+    crate::frame_trace::FrameTraceInputPhase,
+) {
+    use crate::frame_trace::{FrameTraceInputKind as Kind, FrameTraceInputPhase as Phase};
+
+    let touch_phase = |phase: crate::TouchPhase| match phase {
+        crate::TouchPhase::Started => Phase::Started,
+        crate::TouchPhase::Moved => Phase::Moved,
+        crate::TouchPhase::Ended => Phase::Ended,
+    };
+    match event {
+        PlatformInput::KeyDown(_) => (Kind::KeyDown, Phase::Started),
+        PlatformInput::KeyUp(_) => (Kind::KeyUp, Phase::Ended),
+        PlatformInput::ModifiersChanged(_) => (Kind::ModifiersChanged, Phase::Moved),
+        PlatformInput::MouseDown(_) => (Kind::PointerDown, Phase::Started),
+        PlatformInput::MouseUp(_) => (Kind::PointerUp, Phase::Ended),
+        PlatformInput::MouseMove(_) | PlatformInput::MouseExited(_) => {
+            (Kind::PointerMove, Phase::Moved)
+        }
+        PlatformInput::ScrollWheel(event) => (Kind::Scroll, touch_phase(event.touch_phase)),
+        PlatformInput::Magnify(event) => (Kind::Magnify, touch_phase(event.touch_phase)),
+        PlatformInput::FileDrop(_) => (Kind::Other, Phase::None),
+    }
+}
+
+#[cfg(feature = "frame-trace")]
+fn record_native_frame_trace_input(
+    native_event: id,
+    event: &PlatformInput,
+    received_time_ns: u64,
+) -> u64 {
+    let routed_input_sequence_id = crate::frame_trace::current_appkit_input_sequence_id();
+    if routed_input_sequence_id != 0 {
+        return routed_input_sequence_id;
+    }
+    let physical_time_seconds: f64 = unsafe { msg_send![native_event, timestamp] };
+    let physical_time_ns = crate::frame_trace::host_seconds_to_ns(physical_time_seconds);
+    let (kind, phase) = frame_trace_input_metadata(event);
+    crate::frame_trace::record_input(crate::frame_trace::FrameTraceInput {
+        received_time_ns,
+        physical_time_ns,
+        kind,
+        phase,
+        native_event_type: 0,
+        momentum_phase: 0,
+        native_event_number: 0,
+        parent_input_sequence_id: 0,
+        flags: crate::frame_trace::FLAG_PHYSICAL_INPUT,
+    })
+}
+
 // Things to test if you're modifying this method:
 //  U.S. layout:
 //   - The IME consumes characters like 'j' and 'k', which makes paging through `less` in
@@ -1715,6 +1787,8 @@ extern "C" fn handle_key_up(this: &Object, _: Sel, native_event: id) {
 //  Japanese (Romaji) layout:
 //   - type `a i left down up enter enter` should create an unmarked text "愛"
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
+    #[cfg(feature = "frame-trace")]
+    let received_time_ns = crate::frame_trace::monotonic_time_ns();
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
 
@@ -1724,6 +1798,17 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let Some(event) = event else {
         return NO;
     };
+
+    #[cfg(feature = "frame-trace")]
+    let frame_trace_input_sequence_id = {
+        let input_sequence_id =
+            record_native_frame_trace_input(native_event, &event, received_time_ns);
+        crate::frame_trace::record_platform_input_delivery(input_sequence_id);
+        input_sequence_id
+    };
+    #[cfg(feature = "frame-trace")]
+    let _frame_trace_input_scope =
+        crate::frame_trace::enter_current_appkit_input_sequence_id(frame_trace_input_sequence_id);
 
     let run_callback = |event: PlatformInput| -> BOOL {
         let mut callback = window_state.as_ref().lock().event_callback.take();
@@ -1832,6 +1917,8 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
 }
 
 extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+    #[cfg(feature = "frame-trace")]
+    let received_time_ns = crate::frame_trace::monotonic_time_ns();
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
@@ -1839,6 +1926,17 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { PlatformInput::from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        #[cfg(feature = "frame-trace")]
+        let frame_trace_input_sequence_id =
+            record_native_frame_trace_input(native_event, &event, received_time_ns);
+        #[cfg(not(feature = "frame-trace"))]
+        let frame_trace_input_sequence_id = 0;
+        #[cfg(feature = "frame-trace")]
+        crate::frame_trace::record_platform_input_delivery(frame_trace_input_sequence_id);
+        #[cfg(feature = "frame-trace")]
+        let _frame_trace_input_scope = crate::frame_trace::enter_current_appkit_input_sequence_id(
+            frame_trace_input_sequence_id,
+        );
         match &mut event {
             PlatformInput::MouseDown(
                 event @ MouseDownEvent {
@@ -1923,6 +2021,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                             weak_window_state,
                             lock.synthetic_drag_counter,
                             event.clone(),
+                            frame_trace_input_sequence_id,
                         ))
                         .detach();
                 }
@@ -2096,6 +2195,8 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
+                #[cfg(feature = "frame-trace")]
+                crate::frame_trace::invalidate_display_link_context();
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
@@ -2204,6 +2305,8 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
+        #[cfg(feature = "frame-trace")]
+        crate::frame_trace::invalidate_display_link_context();
         callback(Default::default());
 
         let mut lock = window_state.lock();
@@ -2218,6 +2321,32 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+
+    #[cfg(feature = "frame-trace")]
+    {
+        if let Some((target_host_time, tick_sequence, coalesced_tick_count, target_valid)) = lock
+            .display_link
+            .as_mut()
+            .and_then(DisplayLink::take_trace_delivery)
+        {
+            let target_display_time_ns = target_valid
+                .then(|| crate::frame_trace::mach_ticks_to_ns(target_host_time))
+                .unwrap_or_default();
+            let flags = if target_valid {
+                0
+            } else {
+                crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
+            };
+            crate::frame_trace::record_display_link_delivery(
+                target_display_time_ns,
+                tick_sequence,
+                coalesced_tick_count,
+                flags,
+            );
+        } else {
+            crate::frame_trace::invalidate_display_link_context();
+        }
+    }
 
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
@@ -2504,6 +2633,7 @@ async fn synthetic_drag(
     window_state: Weak<Mutex<MacWindowState>>,
     drag_id: usize,
     event: MouseMoveEvent,
+    _parent_input_sequence_id: u64,
 ) {
     loop {
         Timer::after(Duration::from_millis(16)).await;
@@ -2512,6 +2642,26 @@ async fn synthetic_drag(
             if lock.synthetic_drag_counter == drag_id {
                 if let Some(mut callback) = lock.event_callback.take() {
                     drop(lock);
+                    #[cfg(feature = "frame-trace")]
+                    let _frame_trace_input_scope = {
+                        let received_time_ns = crate::frame_trace::monotonic_time_ns();
+                        let input_sequence_id =
+                            crate::frame_trace::record_input(crate::frame_trace::FrameTraceInput {
+                                received_time_ns,
+                                physical_time_ns: 0,
+                                kind: crate::frame_trace::FrameTraceInputKind::PointerMove,
+                                phase: crate::frame_trace::FrameTraceInputPhase::Moved,
+                                native_event_type: 0,
+                                momentum_phase: 0,
+                                native_event_number: 0,
+                                parent_input_sequence_id: _parent_input_sequence_id,
+                                flags: crate::frame_trace::FLAG_SYNTHETIC_INPUT,
+                            });
+                        crate::frame_trace::record_platform_input_delivery(input_sequence_id);
+                        crate::frame_trace::enter_current_appkit_input_sequence_id(
+                            input_sequence_id,
+                        )
+                    };
                     callback(PlatformInput::MouseMove(event.clone()));
                     window_state.lock().event_callback = Some(callback);
                 }

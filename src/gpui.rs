@@ -20,6 +20,8 @@ pub mod default_colors;
 mod element;
 mod elements;
 mod executor;
+#[cfg(feature = "frame-trace")]
+pub mod frame_trace;
 mod geometry;
 mod global;
 mod input;

@@ -124,14 +124,21 @@ impl WindowInvalidator {
 
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
+        #[cfg(feature = "frame-trace")]
+        let was_dirty = inner.dirty;
+        #[cfg(feature = "frame-trace")]
+        let was_drawing = inner.draw_phase != DrawPhase::None;
         inner.dirty_views.insert(entity);
-        if inner.draw_phase == DrawPhase::None {
+        let invalidated = if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
             false
-        }
+        };
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_invalidation(1, was_dirty, was_drawing, 0);
+        invalidated
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -184,6 +191,28 @@ impl WindowInvalidator {
             "this method can only be called during request_layout, prepaint, or paint"
         );
     }
+}
+
+#[cfg(feature = "frame-trace")]
+fn record_frame_trace_invalidation(
+    source: u64,
+    was_dirty: bool,
+    was_drawing: bool,
+    logical_frame_id: u64,
+) {
+    let mut event = crate::frame_trace::FrameTraceEvent::now(
+        crate::frame_trace::FrameTraceEventKind::WindowInvalidated,
+    );
+    event.request_reason = source;
+    event.logical_frame_id = logical_frame_id;
+    event.input_sequence_id = crate::frame_trace::current_appkit_input_sequence_id();
+    if was_dirty {
+        event.flags |= crate::frame_trace::FLAG_INVALIDATION_ALREADY_DIRTY;
+    }
+    if was_drawing {
+        event.flags |= crate::frame_trace::FLAG_INVALIDATION_DURING_DRAW;
+    }
+    crate::frame_trace::record(event);
 }
 
 type AnyObserver = Box<dyn FnMut(&mut Window, &mut App) -> bool + 'static>;
@@ -893,6 +922,10 @@ pub struct Window {
     pub(crate) client_inset: Option<Pixels>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_logical_frame_id: u64,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_input_sequence_id: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -986,6 +1019,19 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
         (false, false) => display_bounds.origin,
     };
     window_bounds_ctor(Bounds::new(final_origin, base_size))
+}
+
+#[cfg(feature = "frame-trace")]
+fn record_frame_trace_scene_event(kind: crate::frame_trace::FrameTraceEventKind, scene: &Scene) {
+    let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
+    event.logical_frame_id = scene.frame_trace_logical_frame_id;
+    event.input_sequence_id = scene.frame_trace_input_sequence_id;
+    event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
+    event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
+    if event.target_display_time_ns == 0 {
+        event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
+    }
+    crate::frame_trace::record(event);
 }
 
 impl Window {
@@ -1319,6 +1365,10 @@ impl Window {
             image_cache_stack: Vec::new(),
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            #[cfg(feature = "frame-trace")]
+            frame_trace_logical_frame_id: 0,
+            #[cfg(feature = "frame-trace")]
+            frame_trace_input_sequence_id: 0,
         })
     }
 
@@ -1424,10 +1474,39 @@ impl Window {
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
     pub fn refresh(&mut self) {
-        if self.invalidator.not_drawing() {
+        #[cfg(feature = "frame-trace")]
+        let was_dirty = self.invalidator.is_dirty();
+        let not_drawing = self.invalidator.not_drawing();
+        if not_drawing {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_invalidation(
+            2,
+            was_dirty,
+            !not_drawing,
+            if not_drawing {
+                0
+            } else {
+                self.frame_trace_logical_frame_id
+            },
+        );
+    }
+
+    /// Returns the logical frame currently being built for diagnostic correlation.
+    #[cfg(feature = "frame-trace")]
+    pub fn frame_trace_logical_frame_id(&self) -> u64 {
+        self.frame_trace_logical_frame_id
+    }
+
+    /// Assigns the latest Canvas input that is visibly reflected by the frame being built.
+    #[cfg(feature = "frame-trace")]
+    pub fn frame_trace_set_input_sequence_id(&mut self, input_sequence_id: u64) {
+        self.frame_trace_input_sequence_id = input_sequence_id;
+        self.next_frame
+            .scene
+            .set_frame_trace_correlation(self.frame_trace_logical_frame_id, input_sequence_id);
     }
 
     /// Close this window.
@@ -2058,6 +2137,18 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        #[cfg(feature = "frame-trace")]
+        {
+            self.frame_trace_logical_frame_id = crate::frame_trace::next_logical_frame_id();
+            self.next_frame.scene.set_frame_trace_correlation(
+                self.frame_trace_logical_frame_id,
+                self.frame_trace_input_sequence_id,
+            );
+            record_frame_trace_scene_event(
+                crate::frame_trace::FrameTraceEventKind::LogicalFrameStarted,
+                &self.next_frame.scene,
+            );
+        }
         self.invalidate_entities();
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
@@ -2125,6 +2216,12 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_scene_event(
+            crate::frame_trace::FrameTraceEventKind::LogicalFrameCompleted,
+            &self.rendered_frame.scene,
+        );
+
         ArenaClearNeeded
     }
 
@@ -2160,6 +2257,11 @@ impl Window {
 
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_scene_event(
+            crate::frame_trace::FrameTraceEventKind::WindowPrepaintStarted,
+            &self.next_frame.scene,
+        );
         self.tooltip_bounds.take();
 
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
@@ -2213,6 +2315,11 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_scene_event(
+            crate::frame_trace::FrameTraceEventKind::WindowPrepaintCompleted,
+            &self.next_frame.scene,
+        );
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -2231,6 +2338,12 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(feature = "frame-trace")]
+        record_frame_trace_scene_event(
+            crate::frame_trace::FrameTraceEventKind::WindowPaintCompleted,
+            &self.next_frame.scene,
+        );
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {

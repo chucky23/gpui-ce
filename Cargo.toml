@@ -26,6 +26,7 @@ test-support = [
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 runtime_shaders = []
+frame-trace = []
 macos-blade = [
     "blade-graphics",
     "blade-macros",

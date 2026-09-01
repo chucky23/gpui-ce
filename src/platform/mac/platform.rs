@@ -77,6 +77,11 @@ unsafe fn build_classes() {
         APP_CLASS = {
             let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
+            #[cfg(feature = "frame-trace")]
+            decl.add_method(
+                sel!(sendEvent:),
+                trace_send_event as extern "C" fn(&mut Object, Sel, id),
+            );
             decl.register()
         }
     };
@@ -153,6 +158,79 @@ unsafe fn build_classes() {
 
             decl.register()
         }
+    }
+}
+
+#[cfg(feature = "frame-trace")]
+extern "C" fn trace_send_event(this: &mut Object, _: Sel, native_event: id) {
+    use crate::frame_trace::{
+        FrameTraceInput, FrameTraceInputKind as Kind, FrameTraceInputPhase as Phase,
+    };
+
+    let received_time_ns = crate::frame_trace::monotonic_time_ns();
+    let event_type: u64 = unsafe { msg_send![native_event, type] };
+    let input_kind = match event_type {
+        1 | 3 | 25 => Some(Kind::PointerDown),
+        2 | 4 | 26 => Some(Kind::PointerUp),
+        5..=9 | 27 => Some(Kind::PointerMove),
+        10 => Some(Kind::KeyDown),
+        11 => Some(Kind::KeyUp),
+        12 => Some(Kind::ModifiersChanged),
+        22 => Some(Kind::Scroll),
+        30 => Some(Kind::Magnify),
+        _ => None,
+    };
+
+    let input_sequence_id = input_kind.map_or(0, |kind| {
+        let physical_time_seconds: f64 = unsafe { msg_send![native_event, timestamp] };
+        let gesture_event = matches!(event_type, 22 | 30);
+        let raw_phase: u64 = if gesture_event {
+            unsafe { msg_send![native_event, phase] }
+        } else {
+            0
+        };
+        let phase = if raw_phase & ((1 << 0) | (1 << 5)) != 0 {
+            Phase::Started
+        } else if raw_phase & ((1 << 3) | (1 << 4)) != 0 {
+            Phase::Ended
+        } else if gesture_event {
+            Phase::Moved
+        } else {
+            match kind {
+                Kind::PointerDown | Kind::KeyDown => Phase::Started,
+                Kind::PointerUp | Kind::KeyUp => Phase::Ended,
+                Kind::PointerMove | Kind::ModifiersChanged => Phase::Moved,
+                _ => Phase::None,
+            }
+        };
+        let momentum_phase = if event_type == 22 {
+            unsafe { msg_send![native_event, momentumPhase] }
+        } else {
+            0
+        };
+        let native_event_number = if matches!(event_type, 1..=9 | 25..=27) {
+            let event_number: i64 = unsafe { msg_send![native_event, eventNumber] };
+            u64::try_from(event_number).unwrap_or_default()
+        } else {
+            0
+        };
+        crate::frame_trace::record_input(FrameTraceInput {
+            received_time_ns,
+            physical_time_ns: crate::frame_trace::host_seconds_to_ns(physical_time_seconds),
+            kind,
+            phase,
+            native_event_type: event_type,
+            momentum_phase,
+            native_event_number,
+            parent_input_sequence_id: 0,
+            flags: crate::frame_trace::FLAG_PHYSICAL_INPUT,
+        })
+    });
+
+    let _input_scope =
+        crate::frame_trace::enter_current_appkit_input_sequence_id(input_sequence_id);
+    unsafe {
+        let _: () = msg_send![super(this, class!(NSApplication)), sendEvent: native_event];
     }
 }
 
