@@ -24,7 +24,7 @@ pub const FLAG_PHYSICAL_INPUT: u64 = 1 << 0;
 pub const FLAG_SYNTHETIC_INPUT: u64 = 1 << 1;
 /// A command buffer was submitted after its current DisplayLink target.
 pub const FLAG_MISSED_DISPLAY_TARGET: u64 = 1 << 2;
-/// Metal reported no valid presentation timestamp for the drawable.
+/// Metal сообщил, что drawable не был показан или соответствующий кадр был отброшен.
 pub const FLAG_PRESENTATION_TIMESTAMP_INVALID: u64 = 1 << 3;
 /// The submitted frame reuses a scene built by an earlier logical frame.
 pub const FLAG_REUSED_SCENE: u64 = 1 << 4;
@@ -116,6 +116,8 @@ pub enum FrameTraceEventKind {
     GpuCompleted,
     /// Core Animation reported the drawable's actual presentation timestamp.
     DrawablePresented,
+    /// Core Animation завершил drawable без показа на экране.
+    DrawableDropped,
     /// The authoritative workload measurement window ended.
     MeasurementWindowCompleted,
     /// Recording stopped before the snapshot was allocated and serialized.

@@ -1116,9 +1116,12 @@ impl MetalRenderer {
                                         Some(depth.saturating_sub(1))
                                     })
                                     .unwrap_or_default();
-                                let mut event = crate::frame_trace::FrameTraceEvent::now(
-                                    crate::frame_trace::FrameTraceEventKind::DrawablePresented,
-                                );
+                                let kind = if presented_time_ns == 0 {
+                                    crate::frame_trace::FrameTraceEventKind::DrawableDropped
+                                } else {
+                                    crate::frame_trace::FrameTraceEventKind::DrawablePresented
+                                };
+                                let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
                                 event.timestamp_ns = if presented_time_ns == 0 {
                                     callback_observed_ns
                                 } else {
