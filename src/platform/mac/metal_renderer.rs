@@ -607,6 +607,9 @@ impl MetalRenderer {
         let frame_trace_scheduled_handler = ConcreteBlock::new({
             let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
+                if !crate::frame_trace::is_detailed_enabled() {
+                    return;
+                }
                 let mut event = crate::frame_trace::FrameTraceEvent::now(
                     crate::frame_trace::FrameTraceEventKind::GpuScheduled,
                 );
@@ -620,6 +623,9 @@ impl MetalRenderer {
         let frame_trace_completed_handler = ConcreteBlock::new({
             let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
+                if !crate::frame_trace::is_detailed_enabled() {
+                    return;
+                }
                 let callback_observed_ns = crate::frame_trace::monotonic_time_ns();
                 let gpu_start_seconds: f64 = unsafe { msg_send![command_buffer, GPUStartTime] };
                 let gpu_end_seconds: f64 = unsafe { msg_send![command_buffer, GPUEndTime] };
@@ -1023,7 +1029,10 @@ impl MetalRenderer {
             origin: point(ScaledPixels(0.), ScaledPixels(0.)),
         };
         #[cfg(feature = "frame-trace")]
-        let next_drawable_started_ns = crate::frame_trace::monotonic_time_ns();
+        let frame_trace_detailed = crate::frame_trace::is_detailed_enabled();
+        #[cfg(feature = "frame-trace")]
+        let next_drawable_started_ns =
+            frame_trace_detailed.then(crate::frame_trace::monotonic_time_ns);
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -1036,7 +1045,7 @@ impl MetalRenderer {
             return;
         };
         #[cfg(feature = "frame-trace")]
-        {
+        if let Some(next_drawable_started_ns) = next_drawable_started_ns {
             let mut event = self.frame_trace_event(
                 crate::frame_trace::FrameTraceEventKind::DrawableAcquired,
                 scene,
@@ -1067,7 +1076,7 @@ impl MetalRenderer {
                     command_buffer.add_completed_handler(&block);
 
                     #[cfg(feature = "frame-trace")]
-                    {
+                    if frame_trace_detailed {
                         command_buffer.add_scheduled_handler(&self.frame_trace_scheduled_handler);
                         command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
                     }
@@ -1231,12 +1240,14 @@ impl MetalRenderer {
                         #[cfg(feature = "frame-trace")]
                         {
                             crate::frame_trace::record(submitted_event);
-                            crate::frame_trace::record(self.frame_trace_event(
-                                crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
-                                scene,
-                                trace_drawable_id,
-                                trace_command_buffer_id,
-                            ));
+                            if frame_trace_detailed {
+                                crate::frame_trace::record(self.frame_trace_event(
+                                    crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
+                                    scene,
+                                    trace_drawable_id,
+                                    trace_command_buffer_id,
+                                ));
+                            }
                         }
                         command_buffer.wait_until_scheduled();
                         drawable.present();
@@ -1248,12 +1259,14 @@ impl MetalRenderer {
                         #[cfg(feature = "frame-trace")]
                         {
                             crate::frame_trace::record(submitted_event);
-                            crate::frame_trace::record(self.frame_trace_event(
-                                crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
-                                scene,
-                                trace_drawable_id,
-                                trace_command_buffer_id,
-                            ));
+                            if frame_trace_detailed {
+                                crate::frame_trace::record(self.frame_trace_event(
+                                    crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
+                                    scene,
+                                    trace_drawable_id,
+                                    trace_command_buffer_id,
+                                ));
+                            }
                         }
                     }
                     #[cfg(feature = "frame-trace")]
@@ -1298,7 +1311,7 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         #[cfg(feature = "frame-trace")]
-        if scene.frame_trace_logical_frame_id != 0 {
+        if crate::frame_trace::is_detailed_enabled() && scene.frame_trace_logical_frame_id != 0 {
             let drawable_id = crate::frame_trace::encode_drawable_id(drawable.drawable_id());
             let command_buffer_id = command_buffer.as_ptr() as usize as u64;
             crate::frame_trace::record(self.frame_trace_event(

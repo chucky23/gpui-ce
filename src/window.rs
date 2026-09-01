@@ -125,9 +125,8 @@ impl WindowInvalidator {
     pub fn invalidate_view(&self, entity: EntityId, cx: &mut App) -> bool {
         let mut inner = self.inner.borrow_mut();
         #[cfg(feature = "frame-trace")]
-        let was_dirty = inner.dirty;
-        #[cfg(feature = "frame-trace")]
-        let was_drawing = inner.draw_phase != DrawPhase::None;
+        let frame_trace_invalidation_state = crate::frame_trace::is_detailed_enabled()
+            .then_some((inner.dirty, inner.draw_phase != DrawPhase::None));
         inner.dirty_views.insert(entity);
         let invalidated = if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
@@ -137,7 +136,9 @@ impl WindowInvalidator {
             false
         };
         #[cfg(feature = "frame-trace")]
-        record_frame_trace_invalidation(1, was_dirty, was_drawing, 0);
+        if let Some((was_dirty, was_drawing)) = frame_trace_invalidation_state {
+            record_frame_trace_invalidation(1, was_dirty, was_drawing, 0);
+        }
         invalidated
     }
 
@@ -200,6 +201,9 @@ fn record_frame_trace_invalidation(
     was_drawing: bool,
     logical_frame_id: u64,
 ) {
+    if !crate::frame_trace::is_detailed_enabled() {
+        return;
+    }
     let mut event = crate::frame_trace::FrameTraceEvent::now(
         crate::frame_trace::FrameTraceEventKind::WindowInvalidated,
     );
@@ -1023,6 +1027,9 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
 
 #[cfg(feature = "frame-trace")]
 fn record_frame_trace_scene_event(kind: crate::frame_trace::FrameTraceEventKind, scene: &Scene) {
+    if !crate::frame_trace::is_detailed_enabled() {
+        return;
+    }
     let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
     event.logical_frame_id = scene.frame_trace_logical_frame_id;
     event.input_sequence_id = scene.frame_trace_input_sequence_id;
@@ -1475,23 +1482,26 @@ impl Window {
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
     pub fn refresh(&mut self) {
         #[cfg(feature = "frame-trace")]
-        let was_dirty = self.invalidator.is_dirty();
+        let frame_trace_was_dirty =
+            crate::frame_trace::is_detailed_enabled().then(|| self.invalidator.is_dirty());
         let not_drawing = self.invalidator.not_drawing();
         if not_drawing {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
         #[cfg(feature = "frame-trace")]
-        record_frame_trace_invalidation(
-            2,
-            was_dirty,
-            !not_drawing,
-            if not_drawing {
-                0
-            } else {
-                self.frame_trace_logical_frame_id
-            },
-        );
+        if let Some(was_dirty) = frame_trace_was_dirty {
+            record_frame_trace_invalidation(
+                2,
+                was_dirty,
+                !not_drawing,
+                if not_drawing {
+                    0
+                } else {
+                    self.frame_trace_logical_frame_id
+                },
+            );
+        }
     }
 
     /// Returns the logical frame currently being built for diagnostic correlation.

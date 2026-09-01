@@ -1565,6 +1565,9 @@ fn record_frame_trace_canvas_event(
     kind: crate::frame_trace::FrameTraceEventKind,
     correlation: FrameTraceCanvasCorrelation,
 ) {
+    if !crate::frame_trace::is_detailed_enabled() {
+        return;
+    }
     let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
     event.logical_frame_id = correlation.logical_frame_id;
     event.input_sequence_id = correlation.input_sequence_id;

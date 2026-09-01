@@ -51,9 +51,20 @@ static NEXT_RENDERER_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISPLAY_TICK_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static LATEST_DISPLAY_TARGET_NS: AtomicU64 = AtomicU64::new(0);
 static LATEST_DISPLAY_TICK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static DETAILED_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CURRENT_APPKIT_INPUT_SEQUENCE_ID: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Amount of diagnostic detail retained by a bounded frame trace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameTraceCaptureLevel {
+    /// Retains only the direct input, submission, and presentation chain.
+    Reference,
+    /// Retains every diagnostic stage in the frame trace.
+    Detailed,
 }
 
 /// One low-cardinality event in the input-to-presentation trace.
@@ -127,6 +138,20 @@ pub enum FrameTraceEventKind {
     MeasurementWindowCompleted,
     /// Recording stopped before the snapshot was allocated and serialized.
     TraceStopped,
+}
+
+impl FrameTraceEventKind {
+    fn retained_in_reference(self) -> bool {
+        matches!(
+            self,
+            Self::TraceStarted
+                | Self::TraceStopped
+                | Self::InputReceived
+                | Self::CommandBufferSubmitted
+                | Self::DrawablePresented
+                | Self::DrawableDropped
+        )
+    }
 }
 
 /// Stable input class recorded without strings or heap payloads.
@@ -443,19 +468,28 @@ impl FrameTraceBuffer {
     }
 }
 
-/// Enables one bounded trace for the lifetime of the current process.
+/// Enables one detailed bounded trace for the lifetime of the current process.
+pub fn start(capacity: usize) -> bool {
+    start_with_level(capacity, FrameTraceCaptureLevel::Detailed)
+}
+
+/// Enables one bounded trace at the requested capture level.
 ///
 /// Allocation occurs here, before measurement. A zero capacity is rejected.
-pub fn start(capacity: usize) -> bool {
+pub fn start_with_level(capacity: usize, level: FrameTraceCaptureLevel) -> bool {
     if capacity == 0 || TRACE.set(FrameTraceBuffer::new(capacity)).is_err() {
         return false;
     }
+    DETAILED_CAPTURE_ENABLED.store(level == FrameTraceCaptureLevel::Detailed, Ordering::Release);
     record(FrameTraceEvent::now(FrameTraceEventKind::TraceStarted));
     true
 }
 
 /// Records one preconstructed POD event without locking or allocating.
 pub fn record(event: FrameTraceEvent) {
+    if !event.kind.retained_in_reference() && !is_detailed_enabled() {
+        return;
+    }
     if let Some(trace) = TRACE.get() {
         let _ = trace.record(event);
     }
@@ -464,6 +498,7 @@ pub fn record(event: FrameTraceEvent) {
 /// Stops recording, waits for in-progress writers, and allocates the serialized snapshot input.
 pub fn stop_and_snapshot() -> Option<FrameTraceSnapshot> {
     let trace = TRACE.get()?;
+    DETAILED_CAPTURE_ENABLED.store(false, Ordering::Release);
     trace.stop_and_snapshot()
 }
 
@@ -472,6 +507,12 @@ pub fn is_enabled() -> bool {
     TRACE
         .get()
         .is_some_and(|trace| trace.writer_state.load(Ordering::Acquire) & WRITER_STOP_BIT == 0)
+}
+
+/// Returns whether detailed-only sites should construct and record events.
+#[inline]
+pub fn is_detailed_enabled() -> bool {
+    DETAILED_CAPTURE_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Records a native or synthetic input and returns its unique sequence identifier.
@@ -538,7 +579,7 @@ pub fn latest_input_sequence_id() -> u64 {
 
 /// Records delivery of a previously identified input to the GPUI platform callback.
 pub fn record_platform_input_delivery(input_sequence_id: u64) {
-    if input_sequence_id == 0 {
+    if input_sequence_id == 0 || !is_detailed_enabled() {
         return;
     }
     let mut event = FrameTraceEvent::now(FrameTraceEventKind::PlatformInputDelivered);
@@ -571,6 +612,9 @@ pub(crate) fn record_display_link_delivery(
 ) {
     LATEST_DISPLAY_TARGET_NS.store(target_display_time_ns, Ordering::Release);
     LATEST_DISPLAY_TICK_SEQUENCE.store(display_tick_sequence, Ordering::Release);
+    if !is_detailed_enabled() {
+        return;
+    }
     let mut event = FrameTraceEvent::now(FrameTraceEventKind::DisplayLinkDelivered);
     event.callback_observed_ns = event.timestamp_ns;
     event.timestamp_ns = callback_time_ns;
@@ -657,6 +701,81 @@ pub fn monotonic_time_ns() -> u64 {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn reference_capture_retains_only_direct_chain_events() {
+        assert!(start_with_level(16, FrameTraceCaptureLevel::Reference));
+        assert!(!is_detailed_enabled());
+
+        record(FrameTraceEvent::now(
+            FrameTraceEventKind::LogicalFrameStarted,
+        ));
+        let physical_input_sequence_id = record_input(FrameTraceInput {
+            received_time_ns: 10,
+            physical_time_ns: 5,
+            kind: FrameTraceInputKind::PointerMove,
+            phase: FrameTraceInputPhase::Moved,
+            native_event_type: 5,
+            momentum_phase: 0,
+            native_event_number: 7,
+            parent_input_sequence_id: 0,
+            flags: FLAG_PHYSICAL_INPUT,
+        });
+        let synthetic_input_sequence_id = record_input(FrameTraceInput {
+            received_time_ns: 20,
+            physical_time_ns: 0,
+            kind: FrameTraceInputKind::Magnify,
+            phase: FrameTraceInputPhase::Moved,
+            native_event_type: 0,
+            momentum_phase: 0,
+            native_event_number: 0,
+            parent_input_sequence_id: physical_input_sequence_id,
+            flags: FLAG_SYNTHETIC_INPUT,
+        });
+
+        let mut submitted = FrameTraceEvent::now(FrameTraceEventKind::CommandBufferSubmitted);
+        submitted.input_sequence_id = synthetic_input_sequence_id;
+        submitted.logical_frame_id = 91;
+        submitted.renderer_instance_id = 3;
+        submitted.renderer_frame_id = 4;
+        submitted.drawable_id = 5;
+        submitted.command_buffer_id = 6;
+        record(submitted);
+
+        let mut presented = submitted;
+        presented.kind = FrameTraceEventKind::DrawablePresented;
+        record(presented);
+        let mut dropped = submitted;
+        dropped.kind = FrameTraceEventKind::DrawableDropped;
+        record(dropped);
+
+        let Some(snapshot) = stop_and_snapshot() else {
+            panic!("reference trace must produce one snapshot");
+        };
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                FrameTraceEventKind::TraceStarted,
+                FrameTraceEventKind::InputReceived,
+                FrameTraceEventKind::InputReceived,
+                FrameTraceEventKind::CommandBufferSubmitted,
+                FrameTraceEventKind::DrawablePresented,
+                FrameTraceEventKind::DrawableDropped,
+                FrameTraceEventKind::TraceStopped,
+            ]
+        );
+        assert_eq!(snapshot.events[3].logical_frame_id, 91);
+        assert_eq!(
+            snapshot.events[3].input_sequence_id,
+            synthetic_input_sequence_id
+        );
+        assert!(!is_enabled());
+        assert!(!is_detailed_enabled());
+    }
 
     #[test]
     fn bounded_trace_retains_the_newest_events_after_wrapping() {

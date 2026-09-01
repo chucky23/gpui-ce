@@ -1476,6 +1476,9 @@ impl PlatformWindow for MacWindow {
     fn draw(&self, scene: &crate::Scene) {
         #[cfg(feature = "frame-trace")]
         let record_stage = |kind| {
+            if !crate::frame_trace::is_detailed_enabled() {
+                return;
+            }
             let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
             event.logical_frame_id = scene.frame_trace_logical_frame_id;
             event.input_sequence_id = scene.frame_trace_input_sequence_id;
