@@ -930,6 +930,8 @@ pub struct Window {
     frame_trace_logical_frame_id: u64,
     #[cfg(feature = "frame-trace")]
     frame_trace_input_sequence_id: u64,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_display_tick: Rc<Cell<Option<crate::frame_trace::FrameTraceDisplayTick>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1031,13 +1033,7 @@ fn record_frame_trace_scene_event(kind: crate::frame_trace::FrameTraceEventKind,
         return;
     }
     let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
-    event.logical_frame_id = scene.frame_trace_logical_frame_id;
-    event.input_sequence_id = scene.frame_trace_input_sequence_id;
-    event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
-    event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
-    if event.target_display_time_ns == 0 {
-        event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
-    }
+    scene.populate_frame_trace_event(&mut event);
     crate::frame_trace::record(event);
 }
 
@@ -1105,6 +1101,8 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
+        #[cfg(feature = "frame-trace")]
+        let frame_trace_display_tick = Rc::new(Cell::new(None));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1133,7 +1131,11 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let last_input_timestamp = last_input_timestamp.clone();
+            #[cfg(feature = "frame-trace")]
+            let frame_trace_display_tick = frame_trace_display_tick.clone();
             move |request_frame_options| {
+                #[cfg(feature = "frame-trace")]
+                frame_trace_display_tick.set(request_frame_options.trace_display_tick);
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1376,6 +1378,8 @@ impl Window {
             frame_trace_logical_frame_id: 0,
             #[cfg(feature = "frame-trace")]
             frame_trace_input_sequence_id: 0,
+            #[cfg(feature = "frame-trace")]
+            frame_trace_display_tick,
         })
     }
 
@@ -1514,9 +1518,41 @@ impl Window {
     #[cfg(feature = "frame-trace")]
     pub fn frame_trace_set_input_sequence_id(&mut self, input_sequence_id: u64) {
         self.frame_trace_input_sequence_id = input_sequence_id;
+        self.next_frame.scene.set_frame_trace_correlation(
+            self.frame_trace_logical_frame_id,
+            input_sequence_id,
+            self.frame_trace_display_tick.get(),
+        );
+    }
+
+    /// Returns the exact DisplayLink tick associated with the active frame request.
+    #[cfg(feature = "frame-trace")]
+    pub fn presentation_diagnostic_display_tick(
+        &self,
+    ) -> Option<crate::frame_trace::FrameTraceDisplayTick> {
+        self.frame_trace_display_tick.get()
+    }
+    /// Attaches a causal Canvas token to the logical frame currently being built.
+    #[cfg(feature = "frame-trace")]
+    pub fn set_next_presentation_diagnostic_token(
+        &mut self,
+        token: crate::frame_trace::PresentationToken,
+    ) {
         self.next_frame
             .scene
-            .set_frame_trace_correlation(self.frame_trace_logical_frame_id, input_sequence_id);
+            .set_frame_trace_presentation_token(token);
+    }
+
+    /// Delays a calibration frame by an exact number of distinct DisplayLink ticks.
+    #[cfg(feature = "frame-trace")]
+    pub fn set_next_presentation_diagnostic_hold_ticks(&mut self, hold_ticks: u8) {
+        assert!(
+            matches!(hold_ticks, 0 | 2 | 3),
+            "diagnostic hold accepts only 0, 2, or 3 ticks"
+        );
+        self.next_frame
+            .scene
+            .set_frame_trace_diagnostic_hold_ticks(hold_ticks);
     }
 
     /// Close this window.
@@ -2153,6 +2189,7 @@ impl Window {
             self.next_frame.scene.set_frame_trace_correlation(
                 self.frame_trace_logical_frame_id,
                 self.frame_trace_input_sequence_id,
+                self.frame_trace_display_tick.get(),
             );
             record_frame_trace_scene_event(
                 crate::frame_trace::FrameTraceEventKind::LogicalFrameStarted,
@@ -2259,7 +2296,30 @@ impl Window {
     }
 
     #[profiling::function]
-    fn present(&self) {
+    fn present(&mut self) {
+        #[cfg(feature = "frame-trace")]
+        {
+            self.rendered_frame
+                .scene
+                .set_frame_trace_presentation_attempt(
+                    crate::frame_trace::next_gpui_window_frame_id(),
+                    self.frame_trace_display_tick.get(),
+                );
+            if self.rendered_frame.scene.take_frame_trace_diagnostic_hold() {
+                let mut event = crate::frame_trace::FrameTraceEvent::now(
+                    crate::frame_trace::FrameTraceEventKind::FrameSubmissionSkipped,
+                );
+                self.rendered_frame
+                    .scene
+                    .populate_frame_trace_event(&mut event);
+                event.submission_skip_reason =
+                    crate::frame_trace::FrameSubmissionSkipReason::DiagnosticHold as u64;
+                crate::frame_trace::record(event);
+                self.needs_present.set(true);
+                profiling::finish_frame!();
+                return;
+            }
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();

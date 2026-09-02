@@ -41,6 +41,20 @@ pub(crate) struct Scene {
     pub(crate) frame_trace_logical_frame_id: u64,
     #[cfg(feature = "frame-trace")]
     pub(crate) frame_trace_input_sequence_id: u64,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_presentation_token: Option<crate::frame_trace::PresentationToken>,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_scene_build_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_presentation_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
+    #[cfg(feature = "frame-trace")]
+    pub(crate) frame_trace_gpui_window_frame_id: u64,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_summary: crate::frame_trace::FrameTraceSceneSummary,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_diagnostic_hold_ticks: u8,
+    #[cfg(feature = "frame-trace")]
+    frame_trace_last_held_tick_sequence: u64,
 }
 
 impl Scene {
@@ -63,6 +77,13 @@ impl Scene {
         {
             self.frame_trace_logical_frame_id = 0;
             self.frame_trace_input_sequence_id = 0;
+            self.frame_trace_presentation_token = None;
+            self.frame_trace_scene_build_tick = None;
+            self.frame_trace_presentation_tick = None;
+            self.frame_trace_gpui_window_frame_id = 0;
+            self.frame_trace_summary = Default::default();
+            self.frame_trace_diagnostic_hold_ticks = 0;
+            self.frame_trace_last_held_tick_sequence = 0;
         }
     }
 
@@ -71,9 +92,107 @@ impl Scene {
         &mut self,
         logical_frame_id: u64,
         input_sequence_id: u64,
+        scene_build_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
     ) {
         self.frame_trace_logical_frame_id = logical_frame_id;
         self.frame_trace_input_sequence_id = input_sequence_id;
+        self.frame_trace_scene_build_tick = scene_build_tick;
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn set_frame_trace_presentation_token(
+        &mut self,
+        token: crate::frame_trace::PresentationToken,
+    ) {
+        self.frame_trace_presentation_token = Some(token);
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn set_frame_trace_diagnostic_hold_ticks(&mut self, hold_ticks: u8) {
+        self.frame_trace_diagnostic_hold_ticks = hold_ticks;
+        self.frame_trace_last_held_tick_sequence = 0;
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn set_frame_trace_presentation_attempt(
+        &mut self,
+        gpui_window_frame_id: u64,
+        tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
+    ) {
+        self.frame_trace_gpui_window_frame_id = gpui_window_frame_id;
+        self.frame_trace_presentation_tick = tick;
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn take_frame_trace_diagnostic_hold(&mut self) -> bool {
+        if self.frame_trace_diagnostic_hold_ticks == 0 {
+            return false;
+        }
+        if let Some(tick) = self.frame_trace_presentation_tick
+            && tick.sequence != 0
+            && tick.coalesced_count == 1
+            && tick.sequence != self.frame_trace_last_held_tick_sequence
+        {
+            self.frame_trace_last_held_tick_sequence = tick.sequence;
+            self.frame_trace_diagnostic_hold_ticks -= 1;
+        }
+        true
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn populate_frame_trace_event(
+        &self,
+        event: &mut crate::frame_trace::FrameTraceEvent,
+    ) {
+        event.logical_frame_id = self.frame_trace_logical_frame_id;
+        event.input_sequence_id = self.frame_trace_input_sequence_id;
+        event.gpui_window_frame_id = self.frame_trace_gpui_window_frame_id;
+        event.presentation_token = self.frame_trace_presentation_token;
+        if let Some(tick) = self.frame_trace_scene_build_tick {
+            event.scene_build_display_tick_sequence = tick.sequence;
+            event.scene_build_target_display_time_ns = tick.target_time_ns();
+            event.scene_build_tick_flags = tick.flags;
+            event.flags |= tick.flags;
+        } else {
+            event.scene_build_tick_flags = crate::frame_trace::FLAG_DISPLAY_CURRENT_INVALID
+                | crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
+                | crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID;
+            event.flags |= event.scene_build_tick_flags;
+        }
+        if let Some(tick) = self.frame_trace_presentation_tick {
+            event.display_id = u64::from(tick.display_id);
+            event.display_current_time_ns = tick.current_time_ns();
+            event.display_refresh_period_ns =
+                if tick.flags & crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID == 0 {
+                    tick.refresh_period_ns
+                } else {
+                    0
+                };
+            event.display_current_host_time_raw = tick.current_host_time_raw;
+            event.display_output_host_time_raw = tick.output_host_time_raw;
+            event.display_video_refresh_period = tick.video_refresh_period;
+            event.display_video_time_scale = i64::from(tick.video_time_scale);
+            event.display_rate_scalar_bits = tick.rate_scalar.to_bits();
+            event.presentation_display_tick_sequence = tick.sequence;
+            event.presentation_target_display_time_ns = tick.target_time_ns();
+            event.presentation_tick_flags = tick.flags;
+            event.coalesced_display_tick_count = tick.coalesced_count;
+            event.flags |= tick.flags;
+        } else {
+            event.presentation_tick_flags = crate::frame_trace::FLAG_DISPLAY_CURRENT_INVALID
+                | crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
+                | crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID;
+            event.flags |= event.presentation_tick_flags;
+        }
+        let summary = self.frame_trace_summary;
+        event.shadow_count = summary.shadow_count;
+        event.quad_count = summary.quad_count;
+        event.path_count = summary.path_count;
+        event.sprite_count = summary.sprite_count;
+        event.surface_count = summary.surface_count;
+        event.shadow_expanded_area_device_px2 = summary.shadow_expanded_area_device_px2;
+        event.quad_area_device_px2 = summary.quad_area_device_px2;
+        event.path_segment_count = summary.path_segment_count;
     }
 
     pub fn len(&self) -> usize {
@@ -100,6 +219,65 @@ impl Scene {
 
         if clipped_bounds.is_empty() {
             return;
+        }
+        #[cfg(feature = "frame-trace")]
+        {
+            fn area(width: ScaledPixels, height: ScaledPixels) -> u64 {
+                let area = f64::from(width).max(0.0) * f64::from(height).max(0.0);
+                if !area.is_finite() || area <= 0.0 {
+                    0
+                } else if area >= u64::MAX as f64 {
+                    u64::MAX
+                } else {
+                    area.round() as u64
+                }
+            }
+            match &primitive {
+                Primitive::Shadow(shadow) => {
+                    self.frame_trace_summary.shadow_count =
+                        self.frame_trace_summary.shadow_count.saturating_add(1);
+                    let margin = f64::from(shadow.blur_radius).max(0.0) * 6.0;
+                    let width = f64::from(shadow.bounds.size.width).max(0.0) + margin;
+                    let height = f64::from(shadow.bounds.size.height).max(0.0) + margin;
+                    let expanded_area = if width.is_finite() && height.is_finite() {
+                        (width * height).round().clamp(0.0, u64::MAX as f64) as u64
+                    } else {
+                        0
+                    };
+                    self.frame_trace_summary.shadow_expanded_area_device_px2 = self
+                        .frame_trace_summary
+                        .shadow_expanded_area_device_px2
+                        .saturating_add(expanded_area);
+                }
+                Primitive::Quad(_) => {
+                    self.frame_trace_summary.quad_count =
+                        self.frame_trace_summary.quad_count.saturating_add(1);
+                    self.frame_trace_summary.quad_area_device_px2 = self
+                        .frame_trace_summary
+                        .quad_area_device_px2
+                        .saturating_add(area(
+                            clipped_bounds.size.width,
+                            clipped_bounds.size.height,
+                        ));
+                }
+                Primitive::Path(path) => {
+                    self.frame_trace_summary.path_count =
+                        self.frame_trace_summary.path_count.saturating_add(1);
+                    self.frame_trace_summary.path_segment_count = self
+                        .frame_trace_summary
+                        .path_segment_count
+                        .saturating_add(path.contour_count as u64);
+                }
+                Primitive::MonochromeSprite(_) | Primitive::PolychromeSprite(_) => {
+                    self.frame_trace_summary.sprite_count =
+                        self.frame_trace_summary.sprite_count.saturating_add(1);
+                }
+                Primitive::Surface(_) => {
+                    self.frame_trace_summary.surface_count =
+                        self.frame_trace_summary.surface_count.saturating_add(1);
+                }
+                Primitive::Underline(_) | Primitive::RasterTile(_) => {}
+            }
         }
 
         let order = self
@@ -1393,5 +1571,130 @@ mod tests {
         });
 
         assert!(scene.clone_vector_paint(0..scene.len()).is_none());
+    }
+    #[cfg(feature = "frame-trace")]
+    fn frame_trace_tick(
+        display_id: u32,
+        sequence: u64,
+        coalesced_count: u64,
+    ) -> crate::frame_trace::FrameTraceDisplayTick {
+        crate::frame_trace::FrameTraceDisplayTick {
+            display_id,
+            sequence,
+            worker_callback_time_ns: sequence * 10,
+            current_host_time_raw: sequence * 100,
+            output_host_time_raw: sequence * 100 + 50,
+            video_refresh_period: 1,
+            video_time_scale: 60,
+            rate_scalar: 1.0,
+            refresh_period_ns: 16_666_667,
+            main_queue_delivery_time_ns: sequence * 10 + 1,
+            coalesced_count,
+            flags: 0,
+        }
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_dirty_draw_and_two_display_reuse_keep_exact_ticks() {
+        let mut build_tick = frame_trace_tick(1, 10, 1);
+        build_tick.flags = crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
+        let first_presentation_tick = frame_trace_tick(1, 11, 1);
+        let second_presentation_tick = frame_trace_tick(2, 12, 1);
+        let token = crate::frame_trace::PresentationToken {
+            run_id_hash: 7,
+            input_sequence: 8,
+            snapshot_generation: 9,
+            canvas_render_generation: 10,
+        };
+        let mut scene = Scene::default();
+        scene.set_frame_trace_correlation(3, 8, Some(build_tick));
+        scene.set_frame_trace_presentation_token(token);
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(0., 0., 10., 20.),
+            content_mask: ContentMask {
+                bounds: scaled_bounds(0., 0., 10., 20.),
+            },
+            ..Default::default()
+        });
+
+        scene.set_frame_trace_presentation_attempt(20, Some(first_presentation_tick));
+        let mut first = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
+        );
+        scene.populate_frame_trace_event(&mut first);
+        scene.set_frame_trace_presentation_attempt(21, Some(second_presentation_tick));
+        let mut reused = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
+        );
+        scene.populate_frame_trace_event(&mut reused);
+
+        assert_eq!(first.presentation_token, Some(token));
+        assert_eq!(reused.presentation_token, Some(token));
+        assert_eq!(first.scene_build_display_tick_sequence, 10);
+        assert_eq!(reused.scene_build_display_tick_sequence, 10);
+        assert_eq!(first.presentation_display_tick_sequence, 11);
+        assert_eq!(reused.presentation_display_tick_sequence, 12);
+        assert_eq!(first.gpui_window_frame_id, 20);
+        assert_eq!(reused.gpui_window_frame_id, 21);
+        assert_eq!(first.display_id, 1);
+        assert_eq!(reused.display_id, 2);
+        assert_eq!(
+            reused.scene_build_tick_flags,
+            crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
+        );
+        assert_eq!(reused.presentation_tick_flags, 0);
+        assert_ne!(
+            reused.flags & crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID,
+            0
+        );
+        assert_eq!(reused.quad_count, 1);
+        assert_eq!(reused.quad_area_device_px2, 200);
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_hold_counts_only_distinct_non_coalesced_ticks() {
+        let mut scene = Scene::default();
+        scene.set_frame_trace_diagnostic_hold_ticks(2);
+
+        scene.set_frame_trace_presentation_attempt(1, Some(frame_trace_tick(1, 10, 2)));
+        assert!(scene.take_frame_trace_diagnostic_hold());
+        scene.set_frame_trace_presentation_attempt(2, Some(frame_trace_tick(1, 11, 1)));
+        assert!(scene.take_frame_trace_diagnostic_hold());
+        scene.set_frame_trace_presentation_attempt(3, Some(frame_trace_tick(1, 11, 1)));
+        assert!(scene.take_frame_trace_diagnostic_hold());
+        scene.set_frame_trace_presentation_attempt(4, Some(frame_trace_tick(1, 12, 1)));
+        assert!(scene.take_frame_trace_diagnostic_hold());
+        scene.set_frame_trace_presentation_attempt(5, Some(frame_trace_tick(1, 13, 1)));
+        assert!(!scene.take_frame_trace_diagnostic_hold());
+    }
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_invalid_display_fields_never_reuse_raw_values_as_valid_times() {
+        let mut tick = frame_trace_tick(7, 20, 1);
+        tick.flags = crate::frame_trace::FLAG_DISPLAY_CURRENT_INVALID
+            | crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
+            | crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID;
+        let mut scene = Scene::default();
+        scene.set_frame_trace_correlation(1, 2, Some(tick));
+        scene.set_frame_trace_presentation_attempt(3, Some(tick));
+        let mut event = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
+        );
+        scene.populate_frame_trace_event(&mut event);
+
+        assert_eq!(event.display_current_time_ns, 0);
+        assert_eq!(event.presentation_target_display_time_ns, 0);
+        assert_eq!(event.display_refresh_period_ns, 0);
+        assert_eq!(
+            event.display_current_host_time_raw,
+            tick.current_host_time_raw
+        );
+        assert_eq!(
+            event.display_output_host_time_raw,
+            tick.output_host_time_raw
+        );
+        assert_eq!(event.flags & tick.flags, tick.flags);
     }
 }

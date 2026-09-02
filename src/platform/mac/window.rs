@@ -1480,13 +1480,7 @@ impl PlatformWindow for MacWindow {
                 return;
             }
             let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
-            event.logical_frame_id = scene.frame_trace_logical_frame_id;
-            event.input_sequence_id = scene.frame_trace_input_sequence_id;
-            event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
-            event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
-            if event.target_display_time_ns == 0 {
-                event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
-            }
+            scene.populate_frame_trace_event(&mut event);
             crate::frame_trace::record(event);
         };
         #[cfg(feature = "frame-trace")]
@@ -2198,8 +2192,6 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
                 lock.renderer.set_presents_with_transaction(true);
                 lock.stop_display_link();
                 drop(lock);
-                #[cfg(feature = "frame-trace")]
-                crate::frame_trace::invalidate_display_link_context();
                 callback(Default::default());
 
                 let mut lock = window_state.lock();
@@ -2308,8 +2300,6 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         lock.renderer.set_presents_with_transaction(true);
         lock.stop_display_link();
         drop(lock);
-        #[cfg(feature = "frame-trace")]
-        crate::frame_trace::invalidate_display_link_context();
         callback(Default::default());
 
         let mut lock = window_state.lock();
@@ -2326,37 +2316,13 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     #[cfg(feature = "frame-trace")]
-    {
-        if let Some((
-            callback_host_time,
-            target_host_time,
-            tick_sequence,
-            coalesced_tick_count,
-            target_valid,
-        )) = lock
-            .display_link
-            .as_mut()
-            .and_then(DisplayLink::take_trace_delivery)
-        {
-            let callback_time_ns = crate::frame_trace::mach_ticks_to_ns(callback_host_time);
-            let target_display_time_ns = target_valid
-                .then(|| crate::frame_trace::mach_ticks_to_ns(target_host_time))
-                .unwrap_or_default();
-            let flags = if target_valid {
-                0
-            } else {
-                crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID
-            };
-            crate::frame_trace::record_display_link_delivery(
-                callback_time_ns,
-                target_display_time_ns,
-                tick_sequence,
-                coalesced_tick_count,
-                flags,
-            );
-        } else {
-            crate::frame_trace::invalidate_display_link_context();
-        }
+    let trace_display_tick = lock
+        .display_link
+        .as_mut()
+        .and_then(DisplayLink::take_trace_delivery);
+    #[cfg(feature = "frame-trace")]
+    if let Some(tick) = trace_display_tick {
+        crate::frame_trace::record_display_link_delivery(tick);
     }
 
     #[cfg(not(feature = "macos-blade"))]
@@ -2364,6 +2330,12 @@ unsafe extern "C" fn step(view: *mut c_void) {
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
+        #[cfg(feature = "frame-trace")]
+        callback(RequestFrameOptions {
+            trace_display_tick,
+            ..Default::default()
+        });
+        #[cfg(not(feature = "frame-trace"))]
         callback(Default::default());
         window_state.lock().request_frame_callback = Some(callback);
     }

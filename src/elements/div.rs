@@ -1574,11 +1574,6 @@ fn record_frame_trace_canvas_event(
     event.request_count = correlation.request_count;
     event.coalesced_request_count = correlation.coalesced_request_count;
     event.dropped_request_count = correlation.dropped_request_count;
-    event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
-    event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
-    if event.target_display_time_ns == 0 {
-        event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
-    }
     crate::frame_trace::record(event);
 }
 

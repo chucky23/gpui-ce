@@ -43,6 +43,162 @@ use std::{
 
 #[cfg(feature = "frame-trace")]
 type FrameTraceCommandBufferHandler = RcBlock<(&'static metal::CommandBufferRef,), ()>;
+#[cfg(feature = "frame-trace")]
+const FRAME_TRACE_COMMAND_METADATA_SLOTS: usize = 64;
+#[cfg(feature = "frame-trace")]
+const FRAME_TRACE_COMMAND_METADATA_FIELDS: usize = 24;
+
+#[cfg(feature = "frame-trace")]
+struct FrameTraceCommandMetadataSlot {
+    command_buffer_id: AtomicU64,
+    fields: [AtomicU64; FRAME_TRACE_COMMAND_METADATA_FIELDS],
+}
+
+#[cfg(feature = "frame-trace")]
+impl FrameTraceCommandMetadataSlot {
+    fn new() -> Self {
+        Self {
+            command_buffer_id: AtomicU64::new(0),
+            fields: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+#[cfg(feature = "frame-trace")]
+struct FrameTraceCommandMetadataTable {
+    slots: [FrameTraceCommandMetadataSlot; FRAME_TRACE_COMMAND_METADATA_SLOTS],
+}
+
+#[cfg(feature = "frame-trace")]
+impl FrameTraceCommandMetadataTable {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| FrameTraceCommandMetadataSlot::new()),
+        }
+    }
+
+    fn register(&self, event: &crate::frame_trace::FrameTraceEvent) {
+        let slot =
+            &self.slots[event.renderer_frame_id as usize % FRAME_TRACE_COMMAND_METADATA_SLOTS];
+        slot.command_buffer_id.store(0, Ordering::Release);
+        let token = event.presentation_token.unwrap_or_default();
+        let fields = [
+            event.input_sequence_id,
+            event.logical_frame_id,
+            event.gpui_window_frame_id,
+            event.renderer_instance_id,
+            event.renderer_frame_id,
+            event.drawable_id,
+            u64::from(event.presentation_token.is_some()),
+            token.run_id_hash,
+            token.input_sequence,
+            token.snapshot_generation,
+            token.canvas_render_generation,
+            event.display_id,
+            event.display_current_time_ns,
+            event.display_refresh_period_ns,
+            event.scene_build_display_tick_sequence,
+            event.scene_build_target_display_time_ns,
+            event.presentation_display_tick_sequence,
+            event.presentation_target_display_time_ns,
+            event.coalesced_display_tick_count,
+            event.flags,
+            event.display_current_host_time_raw,
+            event.display_output_host_time_raw,
+            event.scene_build_tick_flags,
+            event.presentation_tick_flags,
+        ];
+        for (target, value) in slot.fields.iter().zip(fields) {
+            target.store(value, Ordering::Relaxed);
+        }
+        slot.command_buffer_id
+            .store(event.command_buffer_id, Ordering::Release);
+    }
+
+    fn populate(&self, command_buffer_id: u64, event: &mut crate::frame_trace::FrameTraceEvent) {
+        let Some(slot) = self
+            .slots
+            .iter()
+            .find(|slot| slot.command_buffer_id.load(Ordering::Acquire) == command_buffer_id)
+        else {
+            return;
+        };
+        let fields = std::array::from_fn::<_, FRAME_TRACE_COMMAND_METADATA_FIELDS, _>(|index| {
+            slot.fields[index].load(Ordering::Relaxed)
+        });
+        if slot.command_buffer_id.load(Ordering::Acquire) != command_buffer_id {
+            return;
+        }
+        event.input_sequence_id = fields[0];
+        event.logical_frame_id = fields[1];
+        event.gpui_window_frame_id = fields[2];
+        event.renderer_instance_id = fields[3];
+        event.renderer_frame_id = fields[4];
+        event.drawable_id = fields[5];
+        event.presentation_token =
+            (fields[6] != 0).then_some(crate::frame_trace::PresentationToken {
+                run_id_hash: fields[7],
+                input_sequence: fields[8],
+                snapshot_generation: fields[9],
+                canvas_render_generation: fields[10],
+            });
+        event.display_id = fields[11];
+        event.display_current_time_ns = fields[12];
+        event.display_refresh_period_ns = fields[13];
+        event.scene_build_display_tick_sequence = fields[14];
+        event.scene_build_target_display_time_ns = fields[15];
+        event.presentation_display_tick_sequence = fields[16];
+        event.presentation_target_display_time_ns = fields[17];
+        event.coalesced_display_tick_count = fields[18];
+        event.flags = fields[19];
+        event.display_current_host_time_raw = fields[20];
+        event.display_output_host_time_raw = fields[21];
+        event.scene_build_tick_flags = fields[22];
+        event.presentation_tick_flags = fields[23];
+    }
+}
+
+#[cfg(feature = "frame-trace")]
+fn frame_trace_presentation_event(
+    mut event: crate::frame_trace::FrameTraceEvent,
+    presented_time_ns: u64,
+    callback_observed_ns: u64,
+    drawable_id: u64,
+    previous_queue_depth: u64,
+) -> crate::frame_trace::FrameTraceEvent {
+    let submitted_drawable_id = event.drawable_id;
+    event.kind = if presented_time_ns == 0 {
+        crate::frame_trace::FrameTraceEventKind::DrawableDropped
+    } else {
+        crate::frame_trace::FrameTraceEventKind::DrawablePresented
+    };
+    event.timestamp_ns = if presented_time_ns == 0 {
+        callback_observed_ns
+    } else {
+        presented_time_ns
+    };
+    event.callback_observed_ns = callback_observed_ns;
+    event.drawable_id = crate::frame_trace::encode_drawable_id(drawable_id);
+    event.presentation_queue_depth = previous_queue_depth.saturating_sub(1);
+    if presented_time_ns == 0 {
+        event.flags |= crate::frame_trace::FLAG_PRESENTATION_TIMESTAMP_INVALID;
+    }
+    if event.presentation_target_display_time_ns != 0
+        && presented_time_ns
+            > event
+                .presentation_target_display_time_ns
+                .saturating_add(1_000_000)
+    {
+        event.flags |= crate::frame_trace::FLAG_PRESENTED_AFTER_DISPLAY_TARGET;
+    }
+    if previous_queue_depth == 0 {
+        event.flags |= crate::frame_trace::FLAG_QUEUE_DEPTH_UNDERFLOW;
+    }
+    if event.drawable_id != submitted_drawable_id {
+        event.flags |= crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH;
+    }
+    event
+}
 
 // Exported to metal
 pub(crate) type PointF = crate::Point<f32>;
@@ -433,6 +589,8 @@ pub(crate) struct MetalRenderer {
     #[cfg(feature = "frame-trace")]
     frame_trace_presentation_queue_depth: Arc<AtomicU64>,
     #[cfg(feature = "frame-trace")]
+    frame_trace_command_metadata: Arc<FrameTraceCommandMetadataTable>,
+    #[cfg(feature = "frame-trace")]
     frame_trace_scheduled_handler: FrameTraceCommandBufferHandler,
     #[cfg(feature = "frame-trace")]
     frame_trace_completed_handler: FrameTraceCommandBufferHandler,
@@ -604,8 +762,11 @@ impl MetalRenderer {
         #[cfg(feature = "frame-trace")]
         let frame_trace_presentation_queue_depth = Arc::new(AtomicU64::new(0));
         #[cfg(feature = "frame-trace")]
+        let frame_trace_command_metadata = Arc::new(FrameTraceCommandMetadataTable::new());
+        #[cfg(feature = "frame-trace")]
         let frame_trace_scheduled_handler = ConcreteBlock::new({
             let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
+            let command_metadata = frame_trace_command_metadata.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
                 if !crate::frame_trace::is_detailed_enabled() {
                     return;
@@ -614,6 +775,7 @@ impl MetalRenderer {
                     crate::frame_trace::FrameTraceEventKind::GpuScheduled,
                 );
                 event.command_buffer_id = command_buffer.as_ptr() as usize as u64;
+                command_metadata.populate(event.command_buffer_id, &mut event);
                 event.presentation_queue_depth = presentation_queue_depth.load(Ordering::Acquire);
                 crate::frame_trace::record(event);
             }
@@ -622,6 +784,7 @@ impl MetalRenderer {
         #[cfg(feature = "frame-trace")]
         let frame_trace_completed_handler = ConcreteBlock::new({
             let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
+            let command_metadata = frame_trace_command_metadata.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
                 if !crate::frame_trace::is_detailed_enabled() {
                     return;
@@ -641,6 +804,7 @@ impl MetalRenderer {
                 };
                 event.callback_observed_ns = callback_observed_ns;
                 event.command_buffer_id = command_buffer.as_ptr() as usize as u64;
+                command_metadata.populate(event.command_buffer_id, &mut event);
                 event.presentation_queue_depth = presentation_queue_depth.load(Ordering::Acquire);
                 event.gpu_start_time_ns = gpu_start_time_ns;
                 event.gpu_end_time_ns = gpu_end_time_ns;
@@ -690,6 +854,8 @@ impl MetalRenderer {
             #[cfg(feature = "frame-trace")]
             frame_trace_scheduled_handler,
             #[cfg(feature = "frame-trace")]
+            frame_trace_command_metadata,
+            #[cfg(feature = "frame-trace")]
             frame_trace_completed_handler,
             #[cfg(feature = "frame-trace")]
             frame_trace_last_logical_frame_id: 0,
@@ -705,14 +871,11 @@ impl MetalRenderer {
         command_buffer_id: u64,
     ) -> crate::frame_trace::FrameTraceEvent {
         let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
-        event.input_sequence_id = scene.frame_trace_input_sequence_id;
-        event.logical_frame_id = scene.frame_trace_logical_frame_id;
+        scene.populate_frame_trace_event(&mut event);
         event.renderer_instance_id = self.frame_trace_renderer_instance_id;
         event.renderer_frame_id = self.frame_index;
         event.drawable_id = drawable_id;
         event.command_buffer_id = command_buffer_id;
-        event.target_display_time_ns = crate::frame_trace::latest_display_target_ns();
-        event.display_tick_sequence = crate::frame_trace::latest_display_tick_sequence();
         event.presentation_queue_depth = self
             .frame_trace_presentation_queue_depth
             .load(Ordering::Acquire);
@@ -721,10 +884,25 @@ impl MetalRenderer {
         {
             event.flags |= crate::frame_trace::FLAG_REUSED_SCENE;
         }
-        if event.target_display_time_ns == 0 {
-            event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
-        }
         event
+    }
+
+    #[cfg(feature = "frame-trace")]
+    fn record_frame_submission_skipped(
+        &self,
+        scene: &Scene,
+        reason: crate::frame_trace::FrameSubmissionSkipReason,
+        next_drawable_wait_ns: u64,
+    ) {
+        let mut event = self.frame_trace_event(
+            crate::frame_trace::FrameTraceEventKind::FrameSubmissionSkipped,
+            scene,
+            0,
+            0,
+        );
+        event.submission_skip_reason = reason as u64;
+        event.next_drawable_wait_ns = next_drawable_wait_ns;
+        crate::frame_trace::record(event);
     }
 
     pub fn raster_tile_lookup(
@@ -993,30 +1171,31 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        {
-            const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-            let required = required_instance_buffer_size(scene);
-            if required > MAX_INSTANCE_BUFFER_SIZE {
-                log::error!(
-                    "scene instance data requires {} bytes, above the {} byte renderer limit",
-                    required,
-                    MAX_INSTANCE_BUFFER_SIZE
-                );
-            }
-            let mut pool = self.instance_buffer_pool.lock();
-            if pool.buffer_size < required {
-                let target = required
-                    .checked_next_power_of_two()
-                    .unwrap_or(MAX_INSTANCE_BUFFER_SIZE)
-                    .min(MAX_INSTANCE_BUFFER_SIZE);
-                pool.reset(target);
-                log::info!(
-                    "pre-sized instance buffer to {} bytes for a {} byte scene",
-                    target,
-                    required
-                );
-            }
+        const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+        let required = required_instance_buffer_size(scene);
+        #[cfg(feature = "frame-trace")]
+        let frame_trace_instance_buffer_limit = required > MAX_INSTANCE_BUFFER_SIZE;
+        if required > MAX_INSTANCE_BUFFER_SIZE {
+            log::error!(
+                "scene instance data requires {} bytes, above the {} byte renderer limit",
+                required,
+                MAX_INSTANCE_BUFFER_SIZE
+            );
         }
+        let mut pool = self.instance_buffer_pool.lock();
+        if pool.buffer_size < required {
+            let target = required
+                .checked_next_power_of_two()
+                .unwrap_or(MAX_INSTANCE_BUFFER_SIZE)
+                .min(MAX_INSTANCE_BUFFER_SIZE);
+            pool.reset(target);
+            log::info!(
+                "pre-sized instance buffer to {} bytes for a {} byte scene",
+                target,
+                required
+            );
+        }
+        drop(pool);
         self.synchronize_raster_compositors(scene);
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
@@ -1032,10 +1211,29 @@ impl MetalRenderer {
         let frame_trace_detailed = crate::frame_trace::is_detailed_enabled();
         #[cfg(feature = "frame-trace")]
         let next_drawable_started_ns =
-            frame_trace_detailed.then(crate::frame_trace::monotonic_time_ns);
+            crate::frame_trace::is_enabled().then(crate::frame_trace::monotonic_time_ns);
+        #[cfg(feature = "frame-trace")]
+        if frame_trace_detailed {
+            let mut event = self.frame_trace_event(
+                crate::frame_trace::FrameTraceEventKind::NextDrawableStarted,
+                scene,
+                0,
+                0,
+            );
+            event.timestamp_ns = next_drawable_started_ns.unwrap_or_default();
+            crate::frame_trace::record(event);
+        }
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
+            #[cfg(feature = "frame-trace")]
+            if let Some(started_ns) = next_drawable_started_ns {
+                self.record_frame_submission_skipped(
+                    scene,
+                    crate::frame_trace::FrameSubmissionSkipReason::NextDrawableUnavailable,
+                    crate::frame_trace::monotonic_time_ns().saturating_sub(started_ns),
+                );
+            }
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -1075,38 +1273,29 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
-                    #[cfg(feature = "frame-trace")]
-                    if frame_trace_detailed {
-                        command_buffer.add_scheduled_handler(&self.frame_trace_scheduled_handler);
-                        command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
-                    }
-
                     let frame_id = self.frame_index;
                     let submitted_at = Instant::now();
                     let samples = self.presented_frame_samples.clone();
                     let measured_command_buffer = command_buffer.to_owned();
-                    #[cfg(feature = "frame-trace")]
-                    let trace_renderer_instance_id = self.frame_trace_renderer_instance_id;
-                    #[cfg(feature = "frame-trace")]
-                    let trace_renderer_frame_id = self.frame_index;
-                    #[cfg(feature = "frame-trace")]
-                    let trace_logical_frame_id = scene.frame_trace_logical_frame_id;
-                    #[cfg(feature = "frame-trace")]
-                    let trace_input_sequence_id = scene.frame_trace_input_sequence_id;
                     #[cfg(feature = "frame-trace")]
                     let trace_drawable_id =
                         crate::frame_trace::encode_drawable_id(drawable.drawable_id() as u64);
                     #[cfg(feature = "frame-trace")]
                     let trace_command_buffer_id = command_buffer.as_ptr() as usize as u64;
                     #[cfg(feature = "frame-trace")]
-                    let trace_target_display_time_ns =
-                        crate::frame_trace::latest_display_target_ns();
+                    let trace_presented_event = self.frame_trace_event(
+                        crate::frame_trace::FrameTraceEventKind::DrawablePresented,
+                        scene,
+                        trace_drawable_id,
+                        trace_command_buffer_id,
+                    );
                     #[cfg(feature = "frame-trace")]
-                    let trace_display_tick_sequence =
-                        crate::frame_trace::latest_display_tick_sequence();
-                    #[cfg(feature = "frame-trace")]
-                    let trace_reused_scene = trace_logical_frame_id != 0
-                        && trace_logical_frame_id == self.frame_trace_last_logical_frame_id;
+                    if frame_trace_detailed {
+                        self.frame_trace_command_metadata
+                            .register(&trace_presented_event);
+                        command_buffer.add_scheduled_handler(&self.frame_trace_scheduled_handler);
+                        command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
+                    }
                     #[cfg(feature = "frame-trace")]
                     let trace_presentation_queue_depth =
                         self.frame_trace_presentation_queue_depth.clone();
@@ -1125,53 +1314,13 @@ impl MetalRenderer {
                                         Some(depth.saturating_sub(1))
                                     })
                                     .unwrap_or_default();
-                                let kind = if presented_time_ns == 0 {
-                                    crate::frame_trace::FrameTraceEventKind::DrawableDropped
-                                } else {
-                                    crate::frame_trace::FrameTraceEventKind::DrawablePresented
-                                };
-                                let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
-                                event.timestamp_ns = if presented_time_ns == 0 {
-                                    callback_observed_ns
-                                } else {
-                                    presented_time_ns
-                                };
-                                event.callback_observed_ns = callback_observed_ns;
-                                event.input_sequence_id = trace_input_sequence_id;
-                                event.logical_frame_id = trace_logical_frame_id;
-                                event.renderer_instance_id = trace_renderer_instance_id;
-                                event.renderer_frame_id = trace_renderer_frame_id;
-                                event.drawable_id = crate::frame_trace::encode_drawable_id(
+                                let event = frame_trace_presentation_event(
+                                    trace_presented_event,
+                                    presented_time_ns,
+                                    callback_observed_ns,
                                     presented_drawable.drawable_id(),
+                                    previous_queue_depth,
                                 );
-                                event.command_buffer_id = trace_command_buffer_id;
-                                event.target_display_time_ns = trace_target_display_time_ns;
-                                event.display_tick_sequence = trace_display_tick_sequence;
-                                event.presentation_queue_depth =
-                                    previous_queue_depth.saturating_sub(1);
-                                if presented_time_ns == 0 {
-                                    event.flags |=
-                                        crate::frame_trace::FLAG_PRESENTATION_TIMESTAMP_INVALID;
-                                }
-                                if trace_target_display_time_ns == 0 {
-                                    event.flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
-                                }
-                                if trace_target_display_time_ns != 0
-                                    && presented_time_ns
-                                        > trace_target_display_time_ns.saturating_add(1_000_000)
-                                {
-                                    event.flags |=
-                                        crate::frame_trace::FLAG_PRESENTED_AFTER_DISPLAY_TARGET;
-                                }
-                                if previous_queue_depth == 0 {
-                                    event.flags |= crate::frame_trace::FLAG_QUEUE_DEPTH_UNDERFLOW;
-                                }
-                                if event.drawable_id != trace_drawable_id {
-                                    event.flags |= crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH;
-                                }
-                                if trace_reused_scene {
-                                    event.flags |= crate::frame_trace::FLAG_REUSED_SCENE;
-                                }
                                 crate::frame_trace::record(event);
                             }
                             let gpu_start: f64 = unsafe {
@@ -1225,8 +1374,8 @@ impl MetalRenderer {
                         );
                         event.presentation_queue_depth = queue_depth;
                         event.timestamp_ns = crate::frame_trace::monotonic_time_ns();
-                        if event.target_display_time_ns != 0
-                            && event.timestamp_ns > event.target_display_time_ns
+                        if event.presentation_target_display_time_ns != 0
+                            && event.timestamp_ns > event.presentation_target_display_time_ns
                         {
                             event.flags |= crate::frame_trace::FLAG_MISSED_DISPLAY_TARGET;
                         }
@@ -1271,7 +1420,7 @@ impl MetalRenderer {
                     }
                     #[cfg(feature = "frame-trace")]
                     {
-                        self.frame_trace_last_logical_frame_id = trace_logical_frame_id;
+                        self.frame_trace_last_logical_frame_id = scene.frame_trace_logical_frame_id;
                     }
                     let mut deferred = mem::take(&mut self.raster_compositor_deferred_renders);
                     deferred.extend(deferred_renders);
@@ -1296,6 +1445,18 @@ impl MetalRenderer {
                     );
                 }
             }
+        }
+        #[cfg(feature = "frame-trace")]
+        if crate::frame_trace::is_enabled() {
+            self.record_frame_submission_skipped(
+                scene,
+                if frame_trace_instance_buffer_limit {
+                    crate::frame_trace::FrameSubmissionSkipReason::InstanceBufferLimit
+                } else {
+                    crate::frame_trace::FrameSubmissionSkipReason::EncodeRetryExhausted
+                },
+                0,
+            );
         }
         let deferred = mem::take(&mut self.raster_compositor_deferred_renders);
         self.commit_deferred_renders(deferred);
@@ -3179,6 +3340,119 @@ mod raster_comparison_tests {
             raster_size,
             clip_size,
         ));
+    }
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_command_metadata_preserves_token_and_both_ticks() {
+        let table = FrameTraceCommandMetadataTable::new();
+        let token = crate::frame_trace::PresentationToken {
+            run_id_hash: 1,
+            input_sequence: 2,
+            snapshot_generation: 3,
+            canvas_render_generation: 4,
+        };
+        let mut submitted = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
+        );
+        submitted.command_buffer_id = 41;
+        submitted.input_sequence_id = 2;
+        submitted.logical_frame_id = 5;
+        submitted.gpui_window_frame_id = 6;
+        submitted.renderer_instance_id = 7;
+        submitted.renderer_frame_id = 8;
+        submitted.drawable_id = 9;
+        submitted.presentation_token = Some(token);
+        submitted.display_id = 10;
+        submitted.display_current_time_ns = 11;
+        submitted.display_refresh_period_ns = 12;
+        submitted.scene_build_display_tick_sequence = 13;
+        submitted.scene_build_target_display_time_ns = 14;
+        submitted.presentation_display_tick_sequence = 15;
+        submitted.scene_build_tick_flags = 17;
+        submitted.presentation_tick_flags = 18;
+        submitted.presentation_target_display_time_ns = 16;
+        submitted.coalesced_display_tick_count = 1;
+        table.register(&submitted);
+
+        let mut callback = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::GpuCompleted,
+        );
+        callback.command_buffer_id = 41;
+        table.populate(41, &mut callback);
+
+        assert_eq!(callback.presentation_token, Some(token));
+        assert_eq!(callback.logical_frame_id, 5);
+        assert_eq!(callback.gpui_window_frame_id, 6);
+        assert_eq!(callback.renderer_instance_id, 7);
+        assert_eq!(callback.renderer_frame_id, 8);
+        assert_eq!(callback.drawable_id, 9);
+        assert_eq!(callback.display_id, 10);
+        assert_eq!(callback.scene_build_display_tick_sequence, 13);
+        assert_eq!(callback.scene_build_target_display_time_ns, 14);
+        assert_eq!(callback.presentation_display_tick_sequence, 15);
+        assert_eq!(callback.scene_build_tick_flags, 17);
+        assert_eq!(callback.presentation_tick_flags, 18);
+        assert_eq!(callback.presentation_target_display_time_ns, 16);
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_terminal_event_distinguishes_presented_dropped_and_mismatch() {
+        let mut template = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::DrawablePresented,
+        );
+        template.drawable_id = crate::frame_trace::encode_drawable_id(7);
+        template.presentation_target_display_time_ns = 1_000_000;
+
+        let presented = frame_trace_presentation_event(template, 1_500_000, 1_600_000, 7, 1);
+        assert_eq!(
+            presented.kind,
+            crate::frame_trace::FrameTraceEventKind::DrawablePresented
+        );
+        assert_eq!(presented.presentation_queue_depth, 0);
+        assert_eq!(
+            presented.flags & crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH,
+            0
+        );
+
+        let dropped = frame_trace_presentation_event(template, 0, 2_000_000, 8, 0);
+        assert_eq!(
+            dropped.kind,
+            crate::frame_trace::FrameTraceEventKind::DrawableDropped
+        );
+        assert_ne!(
+            dropped.flags & crate::frame_trace::FLAG_PRESENTATION_TIMESTAMP_INVALID,
+            0
+        );
+        assert_ne!(
+            dropped.flags & crate::frame_trace::FLAG_QUEUE_DEPTH_UNDERFLOW,
+            0
+        );
+        assert_ne!(
+            dropped.flags & crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH,
+            0
+        );
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_skip_reasons_remain_closed_and_stable() {
+        assert_eq!(
+            crate::frame_trace::FrameSubmissionSkipReason::NextDrawableUnavailable as u64,
+            1
+        );
+        assert_eq!(
+            crate::frame_trace::FrameSubmissionSkipReason::InstanceBufferLimit as u64,
+            2
+        );
+        assert_eq!(
+            crate::frame_trace::FrameSubmissionSkipReason::EncodeRetryExhausted as u64,
+            3
+        );
+        assert_eq!(
+            crate::frame_trace::FrameSubmissionSkipReason::DiagnosticHold as u64,
+            4
+        );
     }
 }
 

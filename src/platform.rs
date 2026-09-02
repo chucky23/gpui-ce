@@ -461,11 +461,14 @@ impl Tiling {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Default)]
 pub(crate) struct RequestFrameOptions {
     pub(crate) require_presentation: bool,
     /// Force refresh of all rendering states when true
     pub(crate) force_render: bool,
+    /// Exact DisplayLink callback represented by this request.
+    #[cfg(feature = "frame-trace")]
+    pub(crate) trace_display_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
 }
 
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {

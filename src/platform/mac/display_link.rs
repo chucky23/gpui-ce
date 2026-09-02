@@ -16,12 +16,82 @@ use util::ResultExt;
 #[cfg(feature = "frame-trace")]
 struct DisplayLinkCallbackState {
     frame_requests: dispatch_source_t,
+    display_id: CGDirectDisplayID,
     snapshot_version: AtomicU64,
     latest_callback_host_time: AtomicU64,
-    latest_target_host_time: AtomicU64,
-    latest_target_valid: AtomicBool,
+    latest_current_host_time: AtomicU64,
+    latest_output_host_time: AtomicU64,
+    latest_video_refresh_period: AtomicU64,
+    latest_video_time_scale: AtomicU64,
+    latest_rate_scalar_bits: AtomicU64,
+    latest_current_valid: AtomicBool,
+    latest_output_valid: AtomicBool,
+    latest_refresh_valid: AtomicBool,
     latest_tick_sequence_id: AtomicU64,
     callback_count: AtomicU64,
+}
+
+#[cfg(feature = "frame-trace")]
+#[derive(Clone, Copy)]
+struct DisplayLinkTraceSnapshot {
+    callback_host_time: u64,
+    current_host_time_raw: u64,
+    output_host_time_raw: u64,
+    video_refresh_period: i64,
+    video_time_scale: i32,
+    rate_scalar: f64,
+    current_valid: bool,
+    output_valid: bool,
+    refresh_valid: bool,
+    sequence: u64,
+    callback_count: u64,
+}
+
+#[cfg(feature = "frame-trace")]
+fn frame_trace_delivery(
+    display_id: CGDirectDisplayID,
+    snapshot: DisplayLinkTraceSnapshot,
+    last_delivered_callback_count: u64,
+    main_queue_delivery_time_ns: u64,
+) -> Option<crate::frame_trace::FrameTraceDisplayTick> {
+    if snapshot.callback_count == last_delivered_callback_count {
+        return None;
+    }
+    let refresh_period_ns = snapshot
+        .refresh_valid
+        .then(|| {
+            (snapshot.video_refresh_period as f64 * 1_000_000_000.0
+                / snapshot.video_time_scale as f64
+                / snapshot.rate_scalar)
+                .round() as u64
+        })
+        .unwrap_or_default();
+    let mut flags = 0;
+    if !snapshot.current_valid {
+        flags |= crate::frame_trace::FLAG_DISPLAY_CURRENT_INVALID;
+    }
+    if !snapshot.output_valid {
+        flags |= crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID;
+    }
+    if !snapshot.refresh_valid || refresh_period_ns == 0 {
+        flags |= crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID;
+    }
+    Some(crate::frame_trace::FrameTraceDisplayTick {
+        display_id,
+        sequence: snapshot.sequence,
+        worker_callback_time_ns: crate::frame_trace::mach_ticks_to_ns(snapshot.callback_host_time),
+        current_host_time_raw: snapshot.current_host_time_raw,
+        output_host_time_raw: snapshot.output_host_time_raw,
+        video_refresh_period: snapshot.video_refresh_period,
+        video_time_scale: snapshot.video_time_scale,
+        rate_scalar: snapshot.rate_scalar,
+        refresh_period_ns,
+        main_queue_delivery_time_ns,
+        coalesced_count: snapshot
+            .callback_count
+            .saturating_sub(last_delivered_callback_count),
+        flags,
+    })
 }
 
 pub struct DisplayLink {
@@ -51,24 +121,57 @@ impl DisplayLink {
                 #[cfg(feature = "frame-trace")]
                 let frame_requests = {
                     let state = &*(frame_requests as *const DisplayLinkCallbackState);
+                    let current_time = _current_time.as_ref();
                     let output_time = _output_time.as_ref();
                     // SAFETY: mach_absolute_time has no preconditions.
                     let callback_host_time = mach2::mach_time::mach_absolute_time();
-                    let target_valid = output_time
+                    let current_valid = current_time
                         .is_some_and(|time| time.flags & sys::kCVTimeStampHostTimeValid != 0);
-                    let target_host_time = output_time.map_or(0, |time| time.host_time);
+                    let output_valid = output_time
+                        .is_some_and(|time| time.flags & sys::kCVTimeStampHostTimeValid != 0);
+                    let refresh_valid = output_time.is_some_and(|time| {
+                        time.flags & sys::kCVTimeStampVideoRefreshPeriodValid != 0
+                            && time.flags & sys::kCVTimeStampRateScalarValid != 0
+                            && time.video_refresh_period > 0
+                            && time.video_time_scale > 0
+                            && time.rate_scalar.is_finite()
+                            && time.rate_scalar > 0.0
+                    });
                     // CoreVideo invokes one DisplayLink's output callback serially. This
                     // single-writer seqlock publishes a coherent payload to the main thread.
                     state.snapshot_version.fetch_add(1, Ordering::SeqCst);
                     state
                         .latest_callback_host_time
                         .store(callback_host_time, Ordering::SeqCst);
+                    state.latest_current_host_time.store(
+                        current_time.map_or(0, |time| time.host_time),
+                        Ordering::SeqCst,
+                    );
+                    state.latest_output_host_time.store(
+                        output_time.map_or(0, |time| time.host_time),
+                        Ordering::SeqCst,
+                    );
+                    state.latest_video_refresh_period.store(
+                        output_time.map_or(0, |time| time.video_refresh_period as u64),
+                        Ordering::SeqCst,
+                    );
+                    state.latest_video_time_scale.store(
+                        output_time.map_or(0, |time| time.video_time_scale as u64),
+                        Ordering::SeqCst,
+                    );
+                    state.latest_rate_scalar_bits.store(
+                        output_time.map_or(0, |time| time.rate_scalar.to_bits()),
+                        Ordering::SeqCst,
+                    );
                     state
-                        .latest_target_host_time
-                        .store(target_host_time, Ordering::SeqCst);
+                        .latest_current_valid
+                        .store(current_valid, Ordering::SeqCst);
                     state
-                        .latest_target_valid
-                        .store(target_valid, Ordering::SeqCst);
+                        .latest_output_valid
+                        .store(output_valid, Ordering::SeqCst);
+                    state
+                        .latest_refresh_valid
+                        .store(refresh_valid, Ordering::SeqCst);
                     state.latest_tick_sequence_id.store(
                         crate::frame_trace::next_display_tick_sequence_id(),
                         Ordering::SeqCst,
@@ -104,10 +207,17 @@ impl DisplayLink {
             // access it from its worker thread. Its callback context must have the same lifetime.
             let callback_state = Box::leak(Box::new(DisplayLinkCallbackState {
                 frame_requests,
+                display_id,
                 snapshot_version: AtomicU64::new(0),
                 latest_callback_host_time: AtomicU64::new(0),
-                latest_target_host_time: AtomicU64::new(0),
-                latest_target_valid: AtomicBool::new(false),
+                latest_current_host_time: AtomicU64::new(0),
+                latest_output_host_time: AtomicU64::new(0),
+                latest_video_refresh_period: AtomicU64::new(0),
+                latest_video_time_scale: AtomicU64::new(0),
+                latest_rate_scalar_bits: AtomicU64::new(0),
+                latest_current_valid: AtomicBool::new(false),
+                latest_output_valid: AtomicBool::new(false),
+                latest_refresh_valid: AtomicBool::new(false),
                 latest_tick_sequence_id: AtomicU64::new(0),
                 callback_count: AtomicU64::new(0),
             }));
@@ -151,7 +261,9 @@ impl DisplayLink {
     }
 
     #[cfg(feature = "frame-trace")]
-    pub(crate) fn take_trace_delivery(&mut self) -> Option<(u64, u64, u64, u64, bool)> {
+    pub(crate) fn take_trace_delivery(
+        &mut self,
+    ) -> Option<crate::frame_trace::FrameTraceDisplayTick> {
         let version_before = self.callback_state.snapshot_version.load(Ordering::SeqCst);
         if version_before & 1 != 0 {
             return None;
@@ -160,15 +272,40 @@ impl DisplayLink {
             .callback_state
             .latest_callback_host_time
             .load(Ordering::SeqCst);
-        let target_host_time = self
+        let current_host_time_raw = self
             .callback_state
-            .latest_target_host_time
+            .latest_current_host_time
             .load(Ordering::SeqCst);
-        let target_valid = self
+        let output_host_time_raw = self
             .callback_state
-            .latest_target_valid
+            .latest_output_host_time
             .load(Ordering::SeqCst);
-        let tick_sequence_id = self
+        let video_refresh_period = self
+            .callback_state
+            .latest_video_refresh_period
+            .load(Ordering::SeqCst) as i64;
+        let video_time_scale = self
+            .callback_state
+            .latest_video_time_scale
+            .load(Ordering::SeqCst) as i32;
+        let rate_scalar = f64::from_bits(
+            self.callback_state
+                .latest_rate_scalar_bits
+                .load(Ordering::SeqCst),
+        );
+        let current_valid = self
+            .callback_state
+            .latest_current_valid
+            .load(Ordering::SeqCst);
+        let output_valid = self
+            .callback_state
+            .latest_output_valid
+            .load(Ordering::SeqCst);
+        let refresh_valid = self
+            .callback_state
+            .latest_refresh_valid
+            .load(Ordering::SeqCst);
+        let sequence = self
             .callback_state
             .latest_tick_sequence_id
             .load(Ordering::SeqCst);
@@ -177,19 +314,27 @@ impl DisplayLink {
         if version_before != version_after {
             return None;
         }
-        if callback_count == self.last_delivered_callback_count {
-            return None;
-        }
-        let coalesced_tick_count =
-            callback_count.saturating_sub(self.last_delivered_callback_count);
-        self.last_delivered_callback_count = callback_count;
-        Some((
+        let snapshot = DisplayLinkTraceSnapshot {
             callback_host_time,
-            target_host_time,
-            tick_sequence_id,
-            coalesced_tick_count,
-            target_valid,
-        ))
+            current_host_time_raw,
+            output_host_time_raw,
+            video_refresh_period,
+            video_time_scale,
+            rate_scalar,
+            current_valid,
+            output_valid,
+            refresh_valid,
+            sequence,
+            callback_count,
+        };
+        let tick = frame_trace_delivery(
+            self.callback_state.display_id,
+            snapshot,
+            self.last_delivered_callback_count,
+            crate::frame_trace::monotonic_time_ns(),
+        )?;
+        self.last_delivered_callback_count = callback_count;
+        Some(tick)
     }
 }
 
@@ -207,6 +352,62 @@ impl Drop for DisplayLink {
         unsafe {
             dispatch_source_cancel(self.frame_requests);
         }
+    }
+}
+
+#[cfg(all(test, feature = "frame-trace"))]
+mod frame_trace_tests {
+    use super::*;
+
+    fn snapshot(callback_count: u64) -> DisplayLinkTraceSnapshot {
+        DisplayLinkTraceSnapshot {
+            callback_host_time: 10,
+            current_host_time_raw: 20,
+            output_host_time_raw: 30,
+            video_refresh_period: 1,
+            video_time_scale: 60,
+            rate_scalar: 1.0,
+            current_valid: true,
+            output_valid: true,
+            refresh_valid: true,
+            sequence: 40,
+            callback_count,
+        }
+    }
+
+    #[test]
+    fn frame_trace_delivery_reports_coalesced_callbacks_without_reusing_state() {
+        let tick = frame_trace_delivery(7, snapshot(4), 1, 50).unwrap();
+        assert_eq!(tick.display_id, 7);
+        assert_eq!(tick.sequence, 40);
+        assert_eq!(tick.coalesced_count, 3);
+        assert_eq!(tick.main_queue_delivery_time_ns, 50);
+        assert_eq!(tick.refresh_period_ns, 16_666_667);
+        assert!(frame_trace_delivery(7, snapshot(4), 4, 51).is_none());
+    }
+
+    #[test]
+    fn frame_trace_delivery_marks_current_target_and_refresh_independently_invalid() {
+        let mut invalid = snapshot(1);
+        invalid.current_valid = false;
+        invalid.output_valid = false;
+        invalid.refresh_valid = false;
+        let tick = frame_trace_delivery(9, invalid, 0, 60).unwrap();
+        assert_ne!(
+            tick.flags & crate::frame_trace::FLAG_DISPLAY_CURRENT_INVALID,
+            0
+        );
+        assert_ne!(
+            tick.flags & crate::frame_trace::FLAG_DISPLAY_TARGET_INVALID,
+            0
+        );
+        assert_ne!(
+            tick.flags & crate::frame_trace::FLAG_DISPLAY_REFRESH_INVALID,
+            0
+        );
+        assert_eq!(tick.refresh_period_ns, 0);
+        assert_eq!(tick.current_host_time_raw, 20);
+        assert_eq!(tick.output_host_time_raw, 30);
     }
 }
 

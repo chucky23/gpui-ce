@@ -42,19 +42,124 @@ pub const FLAG_PRESENTED_AFTER_DISPLAY_TARGET: u64 = 1 << 9;
 pub const FLAG_INVALIDATION_ALREADY_DIRTY: u64 = 1 << 10;
 /// An invalidation request arrived while GPUI was already drawing the window.
 pub const FLAG_INVALIDATION_DURING_DRAW: u64 = 1 << 11;
+/// A DisplayLink callback did not provide a valid current host time.
+pub const FLAG_DISPLAY_CURRENT_INVALID: u64 = 1 << 12;
+/// A DisplayLink callback did not provide a valid refresh period.
+pub const FLAG_DISPLAY_REFRESH_INVALID: u64 = 1 << 13;
 
 static TRACE: OnceLock<FrameTraceBuffer> = OnceLock::new();
+static ACTIVE_RUN_ID_HASH: AtomicU64 = AtomicU64::new(0);
 static NEXT_INPUT_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static LATEST_INPUT_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOGICAL_FRAME_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_GPUI_WINDOW_FRAME_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RENDERER_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISPLAY_TICK_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
-static LATEST_DISPLAY_TARGET_NS: AtomicU64 = AtomicU64::new(0);
-static LATEST_DISPLAY_TICK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DETAILED_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CURRENT_APPKIT_INPUT_SEQUENCE_ID: Cell<u64> = const { Cell::new(0) };
+}
+/// Stable causal identity attached to one logical Canvas scene.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PresentationToken {
+    /// First eight SHA-256 bytes of the UTF-8 run identifier, interpreted big-endian.
+    pub run_id_hash: u64,
+    /// Input sequence sampled by the Canvas render.
+    pub input_sequence: u64,
+    /// Application snapshot generation sampled by the Canvas render.
+    pub snapshot_generation: u64,
+    /// Monotonic Canvas render generation.
+    pub canvas_render_generation: u64,
+}
+
+/// One coherent `CVDisplayLink` callback delivered to the main queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct FrameTraceDisplayTick {
+    /// CoreGraphics display identifier.
+    pub display_id: u32,
+    /// Process-wide callback sequence.
+    pub sequence: u64,
+    /// Worker callback time on the system host-time clock.
+    pub worker_callback_time_ns: u64,
+    /// Raw `currentTime.hostTime` mach ticks.
+    pub current_host_time_raw: u64,
+    /// Raw `outputTime.hostTime` mach ticks.
+    pub output_host_time_raw: u64,
+    /// Raw `outputTime.videoRefreshPeriod`.
+    pub video_refresh_period: i64,
+    /// Raw `outputTime.videoTimeScale`.
+    pub video_time_scale: i32,
+    /// Raw `outputTime.rateScalar`.
+    pub rate_scalar: f64,
+    /// Validated refresh period on the system host-time clock.
+    pub refresh_period_ns: u64,
+    /// Main-queue observation time on the system host-time clock.
+    pub main_queue_delivery_time_ns: u64,
+    /// Number of worker callbacks represented by this delivery.
+    pub coalesced_count: u64,
+    /// Timestamp-validity flags copied into trace events.
+    pub flags: u64,
+}
+
+impl FrameTraceDisplayTick {
+    /// Validated current host time converted from raw mach ticks.
+    pub fn current_time_ns(self) -> u64 {
+        if self.flags & FLAG_DISPLAY_CURRENT_INVALID != 0 {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            mach_ticks_to_ns(self.current_host_time_raw)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+
+    /// Validated presentation target converted from raw mach ticks.
+    pub fn target_time_ns(self) -> u64 {
+        if self.flags & FLAG_DISPLAY_TARGET_INVALID != 0 {
+            return 0;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            mach_ticks_to_ns(self.output_host_time_raw)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            0
+        }
+    }
+}
+
+/// Incremental natural-cost summary for one scene.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct FrameTraceSceneSummary {
+    pub shadow_count: u64,
+    pub quad_count: u64,
+    pub path_count: u64,
+    pub sprite_count: u64,
+    pub surface_count: u64,
+    pub shadow_expanded_area_device_px2: u64,
+    pub quad_area_device_px2: u64,
+    pub path_segment_count: u64,
+}
+
+/// Closed reason set for a presentation attempt that did not submit a root drawable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[repr(u64)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameSubmissionSkipReason {
+    /// Core Animation returned no root drawable.
+    NextDrawableUnavailable = 1,
+    /// The scene cannot fit in the bounded instance buffer.
+    InstanceBufferLimit = 2,
+    /// Encoding still failed at the maximum bounded instance-buffer size.
+    EncodeRetryExhausted = 3,
+    /// Calibration intentionally deferred this attempt.
+    DiagnosticHold = 4,
 }
 
 /// Amount of diagnostic detail retained by a bounded frame trace.
@@ -118,6 +223,10 @@ pub enum FrameTraceEventKind {
     PlatformDrawRequested,
     /// The macOS renderer gained the platform-window lock and entered draw.
     PlatformDrawStarted,
+    /// The renderer began waiting for the next root drawable.
+    NextDrawableStarted,
+    /// A presentation attempt ended before root command-buffer submission.
+    FrameSubmissionSkipped,
     /// The renderer returned from `nextDrawable`.
     DrawableAcquired,
     /// Metal created the command buffer used by the root drawable.
@@ -147,6 +256,7 @@ impl FrameTraceEventKind {
             Self::TraceStarted
                 | Self::TraceStopped
                 | Self::InputReceived
+                | Self::FrameSubmissionSkipped
                 | Self::CommandBufferSubmitted
                 | Self::DrawablePresented
                 | Self::DrawableDropped
@@ -234,6 +344,8 @@ pub struct FrameTraceEvent {
     pub dropped_request_count: u64,
     /// GPUI logical frame identifier, or zero before a frame is assigned.
     pub logical_frame_id: u64,
+    /// Monotonic GPUI presentation-attempt identifier.
+    pub gpui_window_frame_id: u64,
     /// Renderer instance identifier, or zero before renderer entry.
     pub renderer_instance_id: u64,
     /// Renderer-local submitted frame identifier, or zero before submission.
@@ -242,11 +354,35 @@ pub struct FrameTraceEvent {
     pub drawable_id: u64,
     /// Stable pointer identity of the root Metal command buffer.
     pub command_buffer_id: u64,
-    /// DisplayLink target host time associated with the event, when available.
-    pub target_display_time_ns: u64,
-    /// DisplayLink tick sequence associated with the event, when available.
-    pub display_tick_sequence: u64,
-    /// Number of DisplayLink callbacks represented by a main-thread delivery.
+    /// Display identifier for the presentation attempt.
+    pub display_id: u64,
+    /// Validated current DisplayLink host time, when available.
+    pub display_current_time_ns: u64,
+    /// Validated refresh period, when available.
+    pub display_refresh_period_ns: u64,
+    /// Raw current DisplayLink host time in mach ticks.
+    pub display_current_host_time_raw: u64,
+    /// Raw output DisplayLink host time in mach ticks.
+    pub display_output_host_time_raw: u64,
+    /// Raw DisplayLink video refresh period.
+    pub display_video_refresh_period: i64,
+    /// Raw DisplayLink video time scale.
+    pub display_video_time_scale: i64,
+    /// Raw DisplayLink rate scalar encoded with `f64::to_bits`.
+    pub display_rate_scalar_bits: u64,
+    /// DisplayLink sequence used to build the logical scene.
+    pub scene_build_display_tick_sequence: u64,
+    /// DisplayLink target used to build the logical scene.
+    pub scene_build_target_display_time_ns: u64,
+    /// DisplayLink sequence used for this presentation attempt.
+    pub presentation_display_tick_sequence: u64,
+    /// DisplayLink target used for this presentation attempt.
+    pub presentation_target_display_time_ns: u64,
+    /// Validity flags originating from the scene-build tick.
+    pub scene_build_tick_flags: u64,
+    /// Validity flags originating from the presentation-attempt tick.
+    pub presentation_tick_flags: u64,
+    /// Number of DisplayLink callbacks represented by the presentation tick.
     pub coalesced_display_tick_count: u64,
     /// Number of root drawable presentations in flight after this event.
     pub presentation_queue_depth: u64,
@@ -256,6 +392,26 @@ pub struct FrameTraceEvent {
     pub gpu_start_time_ns: u64,
     /// Absolute Metal `GPUEndTime`, when known.
     pub gpu_end_time_ns: u64,
+    /// Causal Canvas token, absent for non-Canvas scenes and process-level events.
+    pub presentation_token: Option<PresentationToken>,
+    /// Closed numeric [`FrameSubmissionSkipReason`], or zero for submitted events.
+    pub submission_skip_reason: u64,
+    /// Number of shadow primitives.
+    pub shadow_count: u64,
+    /// Number of quad primitives.
+    pub quad_count: u64,
+    /// Number of path primitives.
+    pub path_count: u64,
+    /// Combined monochrome and polychrome sprite count.
+    pub sprite_count: u64,
+    /// Number of platform surface primitives.
+    pub surface_count: u64,
+    /// Total shader-expanded shadow area in squared device pixels.
+    pub shadow_expanded_area_device_px2: u64,
+    /// Total clipped quad area in squared device pixels.
+    pub quad_area_device_px2: u64,
+    /// Total path contour-segment count.
+    pub path_segment_count: u64,
     /// Event flags such as physical-input, missed-target, or invalid-presentation.
     pub flags: u64,
 }
@@ -281,17 +437,40 @@ impl FrameTraceEvent {
             coalesced_request_count: 0,
             dropped_request_count: 0,
             logical_frame_id: 0,
+            gpui_window_frame_id: 0,
             renderer_instance_id: 0,
             renderer_frame_id: 0,
             drawable_id: 0,
             command_buffer_id: 0,
-            target_display_time_ns: 0,
-            display_tick_sequence: 0,
+            display_id: 0,
+            display_current_time_ns: 0,
+            display_refresh_period_ns: 0,
+            display_current_host_time_raw: 0,
+            display_output_host_time_raw: 0,
+            display_video_refresh_period: 0,
+            display_video_time_scale: 0,
+            display_rate_scalar_bits: 0,
+            scene_build_display_tick_sequence: 0,
+            scene_build_target_display_time_ns: 0,
+            presentation_display_tick_sequence: 0,
+            presentation_target_display_time_ns: 0,
+            scene_build_tick_flags: 0,
+            presentation_tick_flags: 0,
             coalesced_display_tick_count: 0,
             presentation_queue_depth: 0,
             next_drawable_wait_ns: 0,
             gpu_start_time_ns: 0,
             gpu_end_time_ns: 0,
+            presentation_token: None,
+            submission_skip_reason: 0,
+            shadow_count: 0,
+            quad_count: 0,
+            path_count: 0,
+            sprite_count: 0,
+            surface_count: 0,
+            shadow_expanded_area_device_px2: 0,
+            quad_area_device_px2: 0,
+            path_segment_count: 0,
             flags: 0,
         }
     }
@@ -323,6 +502,8 @@ pub struct FrameTraceInput {
 /// Immutable trace allocated only after recording has stopped.
 #[derive(Debug, Serialize)]
 pub struct FrameTraceSnapshot {
+    /// Run identity hash fixed before recording starts.
+    pub run_id_hash: u64,
     /// Fixed event capacity used for the run.
     pub capacity: usize,
     /// Oldest events overwritten after the trace wrapped.
@@ -459,6 +640,7 @@ impl FrameTraceBuffer {
         }
         events.sort_unstable_by_key(|event| event.event_sequence_id);
         Some(FrameTraceSnapshot {
+            run_id_hash: ACTIVE_RUN_ID_HASH.load(Ordering::Acquire),
             capacity: self.slots.len(),
             overwritten_events: published_events.saturating_sub(events.len() as u64),
             superseded_writes: self.superseded_writes.load(Ordering::Acquire),
@@ -469,17 +651,18 @@ impl FrameTraceBuffer {
 }
 
 /// Enables one detailed bounded trace for the lifetime of the current process.
-pub fn start(capacity: usize) -> bool {
-    start_with_level(capacity, FrameTraceCaptureLevel::Detailed)
+pub fn start(capacity: usize, run_id_hash: u64) -> bool {
+    start_with_level(capacity, FrameTraceCaptureLevel::Detailed, run_id_hash)
 }
 
 /// Enables one bounded trace at the requested capture level.
 ///
 /// Allocation occurs here, before measurement. A zero capacity is rejected.
-pub fn start_with_level(capacity: usize, level: FrameTraceCaptureLevel) -> bool {
+pub fn start_with_level(capacity: usize, level: FrameTraceCaptureLevel, run_id_hash: u64) -> bool {
     if capacity == 0 || TRACE.set(FrameTraceBuffer::new(capacity)).is_err() {
         return false;
     }
+    ACTIVE_RUN_ID_HASH.store(run_id_hash, Ordering::Release);
     DETAILED_CAPTURE_ENABLED.store(level == FrameTraceCaptureLevel::Detailed, Ordering::Release);
     record(FrameTraceEvent::now(FrameTraceEventKind::TraceStarted));
     true
@@ -499,7 +682,13 @@ pub fn record(event: FrameTraceEvent) {
 pub fn stop_and_snapshot() -> Option<FrameTraceSnapshot> {
     let trace = TRACE.get()?;
     DETAILED_CAPTURE_ENABLED.store(false, Ordering::Release);
-    trace.stop_and_snapshot()
+    let snapshot = trace.stop_and_snapshot();
+    ACTIVE_RUN_ID_HASH.store(0, Ordering::Release);
+    snapshot
+}
+/// Returns the hash bound to the active one-shot trace.
+pub fn active_run_id_hash() -> u64 {
+    ACTIVE_RUN_ID_HASH.load(Ordering::Acquire)
 }
 
 /// Returns whether the one-shot trace is currently accepting events.
@@ -591,6 +780,10 @@ pub fn record_platform_input_delivery(input_sequence_id: u64) {
 pub(crate) fn next_logical_frame_id() -> u64 {
     NEXT_LOGICAL_FRAME_ID.fetch_add(1, Ordering::Relaxed) + 1
 }
+/// Allocates a process-wide GPUI presentation-attempt identifier.
+pub(crate) fn next_gpui_window_frame_id() -> u64 {
+    NEXT_GPUI_WINDOW_FRAME_ID.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// Allocates a process-wide renderer instance identifier.
 pub(crate) fn next_renderer_instance_id() -> u64 {
@@ -602,43 +795,37 @@ pub(crate) fn next_display_tick_sequence_id() -> u64 {
     NEXT_DISPLAY_TICK_SEQUENCE_ID.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// Updates and records the latest DisplayLink callback delivered on the main thread.
-pub(crate) fn record_display_link_delivery(
-    callback_time_ns: u64,
-    target_display_time_ns: u64,
-    display_tick_sequence: u64,
-    coalesced_tick_count: u64,
-    flags: u64,
-) {
-    LATEST_DISPLAY_TARGET_NS.store(target_display_time_ns, Ordering::Release);
-    LATEST_DISPLAY_TICK_SEQUENCE.store(display_tick_sequence, Ordering::Release);
+#[cfg(target_os = "macos")]
+/// Records one exact DisplayLink callback delivered on the main thread.
+pub(crate) fn record_display_link_delivery(tick: FrameTraceDisplayTick) {
     if !is_detailed_enabled() {
         return;
     }
     let mut event = FrameTraceEvent::now(FrameTraceEventKind::DisplayLinkDelivered);
-    event.callback_observed_ns = event.timestamp_ns;
-    event.timestamp_ns = callback_time_ns;
-    event.target_display_time_ns = target_display_time_ns;
-    event.display_tick_sequence = display_tick_sequence;
-    event.coalesced_display_tick_count = coalesced_tick_count;
-    event.flags = flags;
+    event.timestamp_ns = tick.worker_callback_time_ns;
+    event.callback_observed_ns = tick.main_queue_delivery_time_ns;
+    event.display_id = u64::from(tick.display_id);
+    event.display_current_time_ns = if tick.flags & FLAG_DISPLAY_CURRENT_INVALID == 0 {
+        mach_ticks_to_ns(tick.current_host_time_raw)
+    } else {
+        0
+    };
+    event.display_refresh_period_ns = tick.refresh_period_ns;
+    event.display_current_host_time_raw = tick.current_host_time_raw;
+    event.display_output_host_time_raw = tick.output_host_time_raw;
+    event.display_video_refresh_period = tick.video_refresh_period;
+    event.display_video_time_scale = i64::from(tick.video_time_scale);
+    event.display_rate_scalar_bits = tick.rate_scalar.to_bits();
+    event.presentation_display_tick_sequence = tick.sequence;
+    event.presentation_target_display_time_ns = if tick.flags & FLAG_DISPLAY_TARGET_INVALID == 0 {
+        mach_ticks_to_ns(tick.output_host_time_raw)
+    } else {
+        0
+    };
+    event.coalesced_display_tick_count = tick.coalesced_count;
+    event.presentation_tick_flags = tick.flags;
+    event.flags = tick.flags;
     record(event);
-}
-
-/// Prevents transaction-driven frames from inheriting a stale DisplayLink deadline.
-pub(crate) fn invalidate_display_link_context() {
-    LATEST_DISPLAY_TARGET_NS.store(0, Ordering::Release);
-    LATEST_DISPLAY_TICK_SEQUENCE.store(0, Ordering::Release);
-}
-
-/// Returns the latest main-thread DisplayLink target in host-time nanoseconds.
-pub fn latest_display_target_ns() -> u64 {
-    LATEST_DISPLAY_TARGET_NS.load(Ordering::Acquire)
-}
-
-/// Returns the latest main-thread DisplayLink sequence.
-pub fn latest_display_tick_sequence() -> u64 {
-    LATEST_DISPLAY_TICK_SEQUENCE.load(Ordering::Acquire)
 }
 
 /// Converts a floating-point host-clock timestamp to nanoseconds.
@@ -704,7 +891,7 @@ mod tests {
 
     #[test]
     fn reference_capture_retains_only_direct_chain_events() {
-        assert!(start_with_level(16, FrameTraceCaptureLevel::Reference));
+        assert!(start_with_level(16, FrameTraceCaptureLevel::Reference, 7));
         assert!(!is_detailed_enabled());
 
         record(FrameTraceEvent::now(
@@ -752,6 +939,7 @@ mod tests {
         let Some(snapshot) = stop_and_snapshot() else {
             panic!("reference trace must produce one snapshot");
         };
+        assert_eq!(snapshot.run_id_hash, 7);
         assert_eq!(
             snapshot
                 .events
@@ -774,6 +962,7 @@ mod tests {
             synthetic_input_sequence_id
         );
         assert!(!is_enabled());
+        assert_eq!(active_run_id_hash(), 0);
         assert!(!is_detailed_enabled());
     }
 
