@@ -149,6 +149,7 @@ impl Scene {
         event.gpui_window_frame_id = self.frame_trace_gpui_window_frame_id;
         event.presentation_token = self.frame_trace_presentation_token;
         if let Some(tick) = self.frame_trace_scene_build_tick {
+            event.display_id = u64::from(tick.display_id);
             event.scene_build_display_tick_sequence = tick.sequence;
             event.scene_build_target_display_time_ns = tick.target_time_ns();
             event.scene_build_tick_flags = tick.flags;
@@ -1650,6 +1651,27 @@ mod tests {
         );
         assert_eq!(reused.quad_count, 1);
         assert_eq!(reused.quad_area_device_px2, 200);
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn frame_trace_scene_build_tick_sets_display_before_presentation_assignment() {
+        let tick = frame_trace_tick(7, 20, 1);
+        let mut scene = Scene::default();
+        scene.set_frame_trace_correlation(1, 2, Some(tick));
+        let mut event = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::LogicalFrameStarted,
+        );
+
+        scene.populate_frame_trace_event(&mut event);
+
+        assert_eq!(event.display_id, 7);
+        assert_eq!(event.scene_build_display_tick_sequence, 20);
+        assert_eq!(
+            event.scene_build_target_display_time_ns,
+            tick.target_time_ns()
+        );
+        assert_eq!(event.presentation_display_tick_sequence, 0);
     }
 
     #[cfg(feature = "frame-trace")]
