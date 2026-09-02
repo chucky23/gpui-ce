@@ -1316,10 +1316,6 @@ impl MetalRenderer {
                     );
                     #[cfg(feature = "frame-trace")]
                     if frame_trace_detailed {
-                        self.frame_trace_command_metadata.register(
-                            command_buffer.as_ptr() as usize as u64,
-                            &trace_presented_event,
-                        );
                         command_buffer.add_scheduled_handler(&self.frame_trace_scheduled_handler);
                         command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
                     }
@@ -1412,6 +1408,13 @@ impl MetalRenderer {
                     if self.presents_with_transaction {
                         #[cfg(feature = "frame-trace")]
                         let submitted_event = prepare_submission_event();
+                        #[cfg(feature = "frame-trace")]
+                        if frame_trace_detailed {
+                            self.frame_trace_command_metadata.register(
+                                command_buffer.as_ptr() as usize as u64,
+                                &submitted_event,
+                            );
+                        }
                         command_buffer.commit();
                         #[cfg(feature = "frame-trace")]
                         {
@@ -1431,6 +1434,13 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         #[cfg(feature = "frame-trace")]
                         let submitted_event = prepare_submission_event();
+                        #[cfg(feature = "frame-trace")]
+                        if frame_trace_detailed {
+                            self.frame_trace_command_metadata.register(
+                                command_buffer.as_ptr() as usize as u64,
+                                &submitted_event,
+                            );
+                        }
                         command_buffer.commit();
                         #[cfg(feature = "frame-trace")]
                         {
@@ -3425,6 +3435,7 @@ mod raster_comparison_tests {
         submitted.scene_build_tick_flags = 17;
         submitted.presentation_tick_flags = 18;
         submitted.presentation_target_display_time_ns = 16;
+        submitted.flags = crate::frame_trace::FLAG_MISSED_DISPLAY_TARGET;
         submitted.coalesced_display_tick_count = 1;
         table.register(99, &submitted);
 
@@ -3447,6 +3458,10 @@ mod raster_comparison_tests {
         assert_eq!(callback.presentation_display_tick_sequence, 15);
         assert_eq!(callback.scene_build_tick_flags, 17);
         assert_eq!(callback.presentation_tick_flags, 18);
+        assert_eq!(
+            callback.flags,
+            crate::frame_trace::FLAG_MISSED_DISPLAY_TARGET
+        );
         assert_eq!(callback.presentation_target_display_time_ns, 16);
 
         table.remove(99);
