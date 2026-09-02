@@ -158,6 +158,17 @@ impl FrameTraceCommandMetadataTable {
         event.presentation_tick_flags = fields[23];
         event.command_buffer_id = fields[24];
     }
+
+    fn remove(&self, command_buffer_key: u64) {
+        for slot in &self.slots {
+            let _ = slot.command_buffer_key.compare_exchange(
+                command_buffer_key,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
 }
 
 #[cfg(feature = "frame-trace")]
@@ -798,7 +809,9 @@ impl MetalRenderer {
             let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
             let command_metadata = frame_trace_command_metadata.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
+                let command_buffer_key = command_buffer.as_ptr() as usize as u64;
                 if !crate::frame_trace::is_detailed_enabled() {
+                    command_metadata.remove(command_buffer_key);
                     return;
                 }
                 let callback_observed_ns = crate::frame_trace::monotonic_time_ns();
@@ -815,8 +828,9 @@ impl MetalRenderer {
                     gpu_end_time_ns
                 };
                 event.callback_observed_ns = callback_observed_ns;
-                event.command_buffer_id = command_buffer.as_ptr() as usize as u64;
+                event.command_buffer_id = command_buffer_key;
                 command_metadata.populate(event.command_buffer_id, &mut event);
+                command_metadata.remove(command_buffer_key);
                 event.presentation_queue_depth = presentation_queue_depth.load(Ordering::Acquire);
                 event.gpu_start_time_ns = gpu_start_time_ns;
                 event.gpu_end_time_ns = gpu_end_time_ns;
@@ -3434,6 +3448,18 @@ mod raster_comparison_tests {
         assert_eq!(callback.scene_build_tick_flags, 17);
         assert_eq!(callback.presentation_tick_flags, 18);
         assert_eq!(callback.presentation_target_display_time_ns, 16);
+
+        table.remove(99);
+        let mut reused_pointer_submission = submitted;
+        reused_pointer_submission.command_buffer_id = 42;
+        reused_pointer_submission.renderer_frame_id = 9;
+        table.register(99, &reused_pointer_submission);
+        let mut reused_pointer_callback = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::GpuCompleted,
+        );
+        table.populate(99, &mut reused_pointer_callback);
+        assert_eq!(reused_pointer_callback.command_buffer_id, 42);
+        assert_eq!(reused_pointer_callback.renderer_frame_id, 9);
     }
 
     #[cfg(feature = "frame-trace")]
