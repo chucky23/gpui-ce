@@ -161,6 +161,16 @@ impl FrameTraceCommandMetadataTable {
 }
 
 #[cfg(feature = "frame-trace")]
+fn project_frame_trace_capture_level(
+    event: &mut crate::frame_trace::FrameTraceEvent,
+    detailed: bool,
+) {
+    if !detailed {
+        event.coalesced_display_tick_count = 0;
+    }
+}
+
+#[cfg(feature = "frame-trace")]
 fn frame_trace_presentation_event(
     mut event: crate::frame_trace::FrameTraceEvent,
     presented_time_ns: u64,
@@ -874,6 +884,7 @@ impl MetalRenderer {
     ) -> crate::frame_trace::FrameTraceEvent {
         let mut event = crate::frame_trace::FrameTraceEvent::now(kind);
         scene.populate_frame_trace_event(&mut event);
+        project_frame_trace_capture_level(&mut event, crate::frame_trace::is_detailed_enabled());
         event.renderer_instance_id = self.frame_trace_renderer_instance_id;
         event.renderer_frame_id = self.frame_index;
         event.drawable_id = drawable_id;
@@ -3355,6 +3366,21 @@ mod raster_comparison_tests {
             clip_size,
         ));
     }
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn reference_capture_omits_detailed_display_coalescing() {
+        let mut event = crate::frame_trace::FrameTraceEvent::now(
+            crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
+        );
+        event.coalesced_display_tick_count = 3;
+        project_frame_trace_capture_level(&mut event, false);
+        assert_eq!(event.coalesced_display_tick_count, 0);
+
+        event.coalesced_display_tick_count = 3;
+        project_frame_trace_capture_level(&mut event, true);
+        assert_eq!(event.coalesced_display_tick_count, 3);
+    }
+
     #[cfg(feature = "frame-trace")]
     #[test]
     fn frame_trace_command_metadata_preserves_token_and_both_ticks() {
