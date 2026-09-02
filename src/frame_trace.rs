@@ -54,6 +54,7 @@ static LATEST_INPUT_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_LOGICAL_FRAME_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_GPUI_WINDOW_FRAME_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RENDERER_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_COMMAND_BUFFER_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISPLAY_TICK_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static DETAILED_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -788,6 +789,11 @@ pub(crate) fn next_gpui_window_frame_id() -> u64 {
 /// Allocates a process-wide renderer instance identifier.
 pub(crate) fn next_renderer_instance_id() -> u64 {
     NEXT_RENDERER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Allocates a process-wide command-buffer trace identifier.
+pub(crate) fn next_command_buffer_id() -> u64 {
+    NEXT_COMMAND_BUFFER_ID.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// Allocates a process-wide DisplayLink tick identifier that survives link restarts.

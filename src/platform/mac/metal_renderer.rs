@@ -46,11 +46,11 @@ type FrameTraceCommandBufferHandler = RcBlock<(&'static metal::CommandBufferRef,
 #[cfg(feature = "frame-trace")]
 const FRAME_TRACE_COMMAND_METADATA_SLOTS: usize = 64;
 #[cfg(feature = "frame-trace")]
-const FRAME_TRACE_COMMAND_METADATA_FIELDS: usize = 24;
+const FRAME_TRACE_COMMAND_METADATA_FIELDS: usize = 25;
 
 #[cfg(feature = "frame-trace")]
 struct FrameTraceCommandMetadataSlot {
-    command_buffer_id: AtomicU64,
+    command_buffer_key: AtomicU64,
     fields: [AtomicU64; FRAME_TRACE_COMMAND_METADATA_FIELDS],
 }
 
@@ -58,7 +58,7 @@ struct FrameTraceCommandMetadataSlot {
 impl FrameTraceCommandMetadataSlot {
     fn new() -> Self {
         Self {
-            command_buffer_id: AtomicU64::new(0),
+            command_buffer_key: AtomicU64::new(0),
             fields: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -77,10 +77,10 @@ impl FrameTraceCommandMetadataTable {
         }
     }
 
-    fn register(&self, event: &crate::frame_trace::FrameTraceEvent) {
+    fn register(&self, command_buffer_key: u64, event: &crate::frame_trace::FrameTraceEvent) {
         let slot =
             &self.slots[event.renderer_frame_id as usize % FRAME_TRACE_COMMAND_METADATA_SLOTS];
-        slot.command_buffer_id.store(0, Ordering::Release);
+        slot.command_buffer_key.store(0, Ordering::Release);
         let token = event.presentation_token.unwrap_or_default();
         let fields = [
             event.input_sequence_id,
@@ -107,26 +107,27 @@ impl FrameTraceCommandMetadataTable {
             event.display_output_host_time_raw,
             event.scene_build_tick_flags,
             event.presentation_tick_flags,
+            event.command_buffer_id,
         ];
         for (target, value) in slot.fields.iter().zip(fields) {
             target.store(value, Ordering::Relaxed);
         }
-        slot.command_buffer_id
-            .store(event.command_buffer_id, Ordering::Release);
+        slot.command_buffer_key
+            .store(command_buffer_key, Ordering::Release);
     }
 
-    fn populate(&self, command_buffer_id: u64, event: &mut crate::frame_trace::FrameTraceEvent) {
+    fn populate(&self, command_buffer_key: u64, event: &mut crate::frame_trace::FrameTraceEvent) {
         let Some(slot) = self
             .slots
             .iter()
-            .find(|slot| slot.command_buffer_id.load(Ordering::Acquire) == command_buffer_id)
+            .find(|slot| slot.command_buffer_key.load(Ordering::Acquire) == command_buffer_key)
         else {
             return;
         };
         let fields = std::array::from_fn::<_, FRAME_TRACE_COMMAND_METADATA_FIELDS, _>(|index| {
             slot.fields[index].load(Ordering::Relaxed)
         });
-        if slot.command_buffer_id.load(Ordering::Acquire) != command_buffer_id {
+        if slot.command_buffer_key.load(Ordering::Acquire) != command_buffer_key {
             return;
         }
         event.input_sequence_id = fields[0];
@@ -155,6 +156,7 @@ impl FrameTraceCommandMetadataTable {
         event.display_output_host_time_raw = fields[21];
         event.scene_build_tick_flags = fields[22];
         event.presentation_tick_flags = fields[23];
+        event.command_buffer_id = fields[24];
     }
 }
 
@@ -1140,7 +1142,7 @@ impl MetalRenderer {
         loop {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
             match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport) {
-                Ok((command_buffer, deferred_renders)) => {
+                Ok((command_buffer, deferred_renders, _)) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let release = ConcreteBlock::new(move |_| {
@@ -1262,7 +1264,7 @@ impl MetalRenderer {
                 self.draw_primitives(scene, &mut instance_buffer, drawable, viewport);
 
             match command_buffers {
-                Ok((command_buffer, deferred_renders)) => {
+                Ok((command_buffer, deferred_renders, trace_command_buffer_id)) => {
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -1281,8 +1283,6 @@ impl MetalRenderer {
                     let trace_drawable_id =
                         crate::frame_trace::encode_drawable_id(drawable.drawable_id() as u64);
                     #[cfg(feature = "frame-trace")]
-                    let trace_command_buffer_id = command_buffer.as_ptr() as usize as u64;
-                    #[cfg(feature = "frame-trace")]
                     let trace_presented_event = self.frame_trace_event(
                         crate::frame_trace::FrameTraceEventKind::DrawablePresented,
                         scene,
@@ -1291,8 +1291,10 @@ impl MetalRenderer {
                     );
                     #[cfg(feature = "frame-trace")]
                     if frame_trace_detailed {
-                        self.frame_trace_command_metadata
-                            .register(&trace_presented_event);
+                        self.frame_trace_command_metadata.register(
+                            command_buffer.as_ptr() as usize as u64,
+                            &trace_presented_event,
+                        );
                         command_buffer.add_scheduled_handler(&self.frame_trace_scheduled_handler);
                         command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
                     }
@@ -1468,13 +1470,21 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport: Viewport,
-    ) -> Result<(metal::CommandBuffer, Vec<DeferredRender>)> {
+    ) -> Result<(metal::CommandBuffer, Vec<DeferredRender>, u64)> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         #[cfg(feature = "frame-trace")]
+        let trace_command_buffer_id = if crate::frame_trace::is_enabled() {
+            crate::frame_trace::next_command_buffer_id()
+        } else {
+            0
+        };
+        #[cfg(not(feature = "frame-trace"))]
+        let trace_command_buffer_id = 0;
+        #[cfg(feature = "frame-trace")]
         if crate::frame_trace::is_detailed_enabled() && scene.frame_trace_logical_frame_id != 0 {
             let drawable_id = crate::frame_trace::encode_drawable_id(drawable.drawable_id());
-            let command_buffer_id = command_buffer.as_ptr() as usize as u64;
+            let command_buffer_id = trace_command_buffer_id;
             crate::frame_trace::record(self.frame_trace_event(
                 crate::frame_trace::FrameTraceEventKind::CommandBufferCreated,
                 scene,
@@ -1710,7 +1720,11 @@ impl MetalRenderer {
             location: 0,
             length: instance_offset as NSUInteger,
         });
-        Ok((command_buffer.to_owned(), deferred_renders))
+        Ok((
+            command_buffer.to_owned(),
+            deferred_renders,
+            trace_command_buffer_id,
+        ))
     }
 
     fn encode_scene(
@@ -3372,14 +3386,15 @@ mod raster_comparison_tests {
         submitted.presentation_tick_flags = 18;
         submitted.presentation_target_display_time_ns = 16;
         submitted.coalesced_display_tick_count = 1;
-        table.register(&submitted);
+        table.register(99, &submitted);
 
         let mut callback = crate::frame_trace::FrameTraceEvent::now(
             crate::frame_trace::FrameTraceEventKind::GpuCompleted,
         );
-        callback.command_buffer_id = 41;
-        table.populate(41, &mut callback);
+        callback.command_buffer_id = 99;
+        table.populate(99, &mut callback);
 
+        assert_eq!(callback.command_buffer_id, 41);
         assert_eq!(callback.presentation_token, Some(token));
         assert_eq!(callback.logical_frame_id, 5);
         assert_eq!(callback.gpui_window_frame_id, 6);
