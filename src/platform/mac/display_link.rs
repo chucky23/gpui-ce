@@ -250,12 +250,6 @@ impl DisplayLink {
         Ok(())
     }
 
-    pub fn request_frame(&self) {
-        unsafe {
-            dispatch_source_merge_data(self.frame_requests, 1);
-        }
-    }
-
     pub fn stop(&mut self) -> Result<()> {
         unsafe {
             dispatch_suspend(crate::dispatch_sys::dispatch_object_t {

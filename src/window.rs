@@ -1234,20 +1234,11 @@ impl Window {
                     .log_err();
             }
         }));
-        let request_input_frame_immediately = cfg!(target_os = "macos")
-            && std::env::var("GPUI_IMMEDIATE_INPUT_FRAME")
-                .is_ok_and(|value| value == "true" || value == "1");
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| {
-                        let result = window.dispatch_event(event, cx);
-                        if request_input_frame_immediately && window.invalidator.is_dirty() {
-                            window.platform_window.request_frame();
-                        }
-                        result
-                    })
+                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
