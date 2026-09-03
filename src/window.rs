@@ -916,6 +916,7 @@ pub struct Window {
     pub(crate) last_input_timestamp: Rc<Cell<Instant>>,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    request_frame_immediately: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1234,20 +1235,11 @@ impl Window {
                     .log_err();
             }
         }));
-        let request_input_frame_immediately = cfg!(target_os = "macos")
-            && std::env::var("GPUI_IMMEDIATE_INPUT_FRAME")
-                .is_ok_and(|value| value == "true" || value == "1");
         platform_window.on_input({
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| {
-                        let result = window.dispatch_event(event, cx);
-                        if request_input_frame_immediately && window.invalidator.is_dirty() {
-                            window.platform_window.request_frame();
-                        }
-                        result
-                    })
+                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -1372,6 +1364,9 @@ impl Window {
             last_input_timestamp,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            request_frame_immediately: cfg!(target_os = "macos")
+                && std::env::var("GPUI_IMMEDIATE_FRAME")
+                    .is_ok_and(|value| value == "true" || value == "1"),
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -1501,6 +1496,9 @@ impl Window {
         if not_drawing {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
+            if self.request_frame_immediately {
+                self.platform_window.request_frame();
+            }
         }
         #[cfg(feature = "frame-trace")]
         if let Some(was_dirty) = frame_trace_was_dirty {
