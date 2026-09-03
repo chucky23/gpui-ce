@@ -1364,9 +1364,7 @@ impl Window {
             last_input_timestamp,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
-            request_frame_immediately: cfg!(target_os = "macos")
-                && std::env::var("GPUI_IMMEDIATE_FRAME")
-                    .is_ok_and(|value| value == "true" || value == "1"),
+            request_frame_immediately: cfg!(target_os = "macos"),
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
