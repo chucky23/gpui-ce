@@ -16,7 +16,9 @@ use std::{
 const WRITING_SEQUENCE_BIT: u64 = 1 << 63;
 const SEQUENCE_MASK: u64 = !WRITING_SEQUENCE_BIT;
 const WRITER_STOP_BIT: usize = 1 << (usize::BITS - 1);
-const WRITER_COUNT_MASK: usize = !WRITER_STOP_BIT;
+const WRITER_OVERFLOW_BIT: usize = 1 << (usize::BITS - 2);
+const WRITER_COUNT_MASK: usize = WRITER_OVERFLOW_BIT - 1;
+const WRITER_ACTIVE_MASK: usize = WRITER_OVERFLOW_BIT | WRITER_COUNT_MASK;
 
 /// Input originated from an AppKit event with a valid native timestamp.
 pub const FLAG_PHYSICAL_INPUT: u64 = 1 << 0;
@@ -554,22 +556,12 @@ impl FrameTraceBuffer {
     }
 
     fn record(&self, event: FrameTraceEvent) -> bool {
-        let mut writer_state = self.writer_state.load(Ordering::Acquire);
-        loop {
-            if writer_state & WRITER_STOP_BIT != 0
-                || writer_state & WRITER_COUNT_MASK == WRITER_COUNT_MASK
-            {
-                return false;
-            }
-            match self.writer_state.compare_exchange_weak(
-                writer_state,
-                writer_state + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => writer_state = observed,
-            }
+        let previous = self.writer_state.fetch_add(1, Ordering::AcqRel);
+        if previous & (WRITER_STOP_BIT | WRITER_OVERFLOW_BIT) != 0
+            || previous & WRITER_COUNT_MASK == WRITER_COUNT_MASK
+        {
+            self.writer_state.fetch_sub(1, Ordering::Release);
+            return false;
         }
 
         let published = self.write_registered(event);
@@ -620,7 +612,7 @@ impl FrameTraceBuffer {
         }
         self.writer_state
             .fetch_or(WRITER_STOP_BIT, Ordering::AcqRel);
-        while self.writer_state.load(Ordering::Acquire) & WRITER_COUNT_MASK != 0 {
+        while self.writer_state.load(Ordering::Acquire) & WRITER_ACTIVE_MASK != 0 {
             spin_loop();
         }
         let _ = self.write_registered(FrameTraceEvent::now(FrameTraceEventKind::TraceStopped));
@@ -987,6 +979,22 @@ mod tests {
         assert_eq!(snapshot.contended_writes, 0);
         assert_eq!(snapshot.events[0].event_sequence_id, 3);
         assert_eq!(snapshot.events[1].event_sequence_id, 4);
+    }
+
+    #[test]
+    fn writer_count_overflow_fails_without_losing_stop_state() {
+        let trace = FrameTraceBuffer::new(2);
+        for state in [
+            WRITER_COUNT_MASK,
+            WRITER_OVERFLOW_BIT,
+            WRITER_STOP_BIT | WRITER_COUNT_MASK,
+        ] {
+            trace.writer_state.store(state, Ordering::Release);
+            assert!(!trace.record(FrameTraceEvent::now(
+                FrameTraceEventKind::LogicalFrameStarted,
+            )));
+            assert_eq!(trace.writer_state.load(Ordering::Acquire), state);
+        }
     }
 
     #[test]
