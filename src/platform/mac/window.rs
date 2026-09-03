@@ -1384,6 +1384,12 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().request_frame_callback = Some(callback);
     }
 
+    fn request_frame(&self) {
+        if let Some(display_link) = self.0.as_ref().lock().display_link.as_ref() {
+            display_link.request_frame();
+        }
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>) {
         self.0.as_ref().lock().event_callback = Some(callback);
     }
