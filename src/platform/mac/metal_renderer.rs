@@ -605,6 +605,8 @@ pub(crate) struct MetalRenderer {
     raster_compositor_layers: HashMap<u64, RasterCompositorLayer>,
     raster_compositor_deferred_renders: Vec<DeferredRender>,
     frame_index: u64,
+    // Начало и конец последнего вызова nextDrawable основного слоя в mach host time.
+    last_drawable_wait: (u64, u64),
     presented_frame_samples: Arc<Mutex<Vec<FramePresentationSample>>>,
     raster_compositor_presentation_samples: Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
     #[cfg(feature = "frame-trace")]
@@ -871,6 +873,7 @@ impl MetalRenderer {
             raster_compositor_layers: HashMap::new(),
             raster_compositor_deferred_renders: Vec::new(),
             frame_index: 0,
+            last_drawable_wait: (0, 0),
             presented_frame_samples: Arc::new(Mutex::new(Vec::new())),
             raster_compositor_presentation_samples: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "frame-trace")]
@@ -1196,6 +1199,12 @@ impl MetalRenderer {
         }
     }
 
+    /// Начало и конец последнего ожидания nextDrawable в [`Self::draw`] в mach host time;
+    /// `(0, 0)`, пока кадров не было.
+    pub(crate) fn last_drawable_wait(&self) -> (u64, u64) {
+        self.last_drawable_wait
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         self.frame_index = self.frame_index.wrapping_add(1);
         const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -1250,7 +1259,10 @@ impl MetalRenderer {
             event.timestamp_ns = next_drawable_started_ns.unwrap_or_default();
             crate::frame_trace::record(event);
         }
-        let drawable = if let Some(drawable) = layer.next_drawable() {
+        let drawable_wait_started = super::display_link::host_time_now();
+        let drawable = layer.next_drawable();
+        self.last_drawable_wait = (drawable_wait_started, super::display_link::host_time_now());
+        let drawable = if let Some(drawable) = drawable {
             drawable
         } else {
             #[cfg(feature = "frame-trace")]

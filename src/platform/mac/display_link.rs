@@ -10,12 +10,70 @@ use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use std::ffi::c_void;
 #[cfg(feature = "frame-trace")]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use util::ResultExt;
+
+/// Текущее системное host time в mach ticks.
+pub(crate) fn host_time_now() -> u64 {
+    // SAFETY: mach_absolute_time has no preconditions.
+    unsafe { mach2::mach_time::mach_absolute_time() }
+}
+
+/// Переводит наносекунды в mach host ticks; `None`, если timebase недоступна.
+pub(crate) fn host_ticks_from_ns(nanoseconds: u64) -> Option<u64> {
+    use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
+
+    static TIMEBASE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    let (numer, denom) = (*TIMEBASE.get_or_init(|| {
+        let mut value = mach_timebase_info_data_t { numer: 0, denom: 0 };
+        // SAFETY: value is a valid out pointer for mach_timebase_info.
+        let result = unsafe { mach_timebase_info(&mut value) };
+        (result == 0 && value.numer != 0 && value.denom != 0).then_some((value.numer, value.denom))
+    }))?;
+    let ticks = u128::from(nanoseconds) * u128::from(denom) / u128::from(numer);
+    Some(u64::try_from(ticks).unwrap_or(u64::MAX))
+}
+
+/// Mach host time первого и последнего колбэков DisplayLink, ещё не забранных главным потоком.
+/// Ноль означает, что ожидающих колбэков нет.
+#[derive(Default)]
+struct PendingTicks {
+    first: AtomicU64,
+    last: AtomicU64,
+}
+
+impl PendingTicks {
+    fn record(&self, host_time: u64) {
+        // Неудача означает, что первый тик пачки уже записан; его нужно сохранить.
+        self.first
+            .compare_exchange(0, host_time, Ordering::AcqRel, Ordering::Relaxed)
+            .ok();
+        self.last.store(host_time, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<(u64, u64)> {
+        // Тик, записанный между двумя swap, попадёт и в этот результат как последний, и в
+        // следующий как первый. В обоих случаях он только мешает пропуску шага, но не вызывает его.
+        let first = self.first.swap(0, Ordering::AcqRel);
+        let last = self.last.swap(0, Ordering::AcqRel);
+        (first != 0).then(|| (first, last.max(first)))
+    }
+}
+
+#[cfg(not(feature = "frame-trace"))]
+struct DisplayLinkCallbackState {
+    frame_requests: dispatch_source_t,
+    pending_ticks: PendingTicks,
+}
 
 #[cfg(feature = "frame-trace")]
 struct DisplayLinkCallbackState {
     frame_requests: dispatch_source_t,
+    pending_ticks: PendingTicks,
     display_id: CGDirectDisplayID,
     snapshot_version: AtomicU64,
     latest_callback_host_time: AtomicU64,
@@ -97,7 +155,6 @@ fn frame_trace_delivery(
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,
     frame_requests: dispatch_source_t,
-    #[cfg(feature = "frame-trace")]
     callback_state: &'static DisplayLinkCallbackState,
     #[cfg(feature = "frame-trace")]
     last_delivered_callback_count: u64,
@@ -115,16 +172,16 @@ impl DisplayLink {
             _output_time: *const sys::CVTimeStamp,
             _flags_in: i64,
             _flags_out: *mut i64,
-            frame_requests: *mut c_void,
+            callback_state: *mut c_void,
         ) -> i32 {
             unsafe {
+                let state = &*(callback_state as *const DisplayLinkCallbackState);
+                let callback_host_time = host_time_now();
+                state.pending_ticks.record(callback_host_time);
                 #[cfg(feature = "frame-trace")]
-                let frame_requests = {
-                    let state = &*(frame_requests as *const DisplayLinkCallbackState);
+                {
                     let current_time = _current_time.as_ref();
                     let output_time = _output_time.as_ref();
-                    // SAFETY: mach_absolute_time has no preconditions.
-                    let callback_host_time = mach2::mach_time::mach_absolute_time();
                     let current_valid = current_time
                         .is_some_and(|time| time.flags & sys::kCVTimeStampHostTimeValid != 0);
                     let output_valid = output_time
@@ -178,11 +235,8 @@ impl DisplayLink {
                     );
                     state.callback_count.fetch_add(1, Ordering::SeqCst);
                     state.snapshot_version.fetch_add(1, Ordering::SeqCst);
-                    state.frame_requests
-                };
-                #[cfg(not(feature = "frame-trace"))]
-                let frame_requests = frame_requests as dispatch_source_t;
-                dispatch_source_merge_data(frame_requests, 1);
+                }
+                dispatch_source_merge_data(state.frame_requests, 1);
                 0
             }
         }
@@ -202,11 +256,17 @@ impl DisplayLink {
             );
             dispatch_source_set_event_handler_f(frame_requests, Some(callback));
 
-            #[cfg(feature = "frame-trace")]
             // DisplayLink itself is intentionally leaked on drop because CoreVideo may still
             // access it from its worker thread. Its callback context must have the same lifetime.
+            #[cfg(not(feature = "frame-trace"))]
             let callback_state = Box::leak(Box::new(DisplayLinkCallbackState {
                 frame_requests,
+                pending_ticks: PendingTicks::default(),
+            }));
+            #[cfg(feature = "frame-trace")]
+            let callback_state = Box::leak(Box::new(DisplayLinkCallbackState {
+                frame_requests,
+                pending_ticks: PendingTicks::default(),
                 display_id,
                 snapshot_version: AtomicU64::new(0),
                 latest_callback_host_time: AtomicU64::new(0),
@@ -221,10 +281,7 @@ impl DisplayLink {
                 latest_tick_sequence_id: AtomicU64::new(0),
                 callback_count: AtomicU64::new(0),
             }));
-            #[cfg(feature = "frame-trace")]
             let display_link_context = callback_state as *const _ as *mut c_void;
-            #[cfg(not(feature = "frame-trace"))]
-            let display_link_context = frame_requests as *mut c_void;
 
             let display_link =
                 sys::DisplayLink::new(display_id, display_link_callback, display_link_context)?;
@@ -232,7 +289,6 @@ impl DisplayLink {
             Ok(Self {
                 display_link: Some(display_link),
                 frame_requests,
-                #[cfg(feature = "frame-trace")]
                 callback_state,
                 #[cfg(feature = "frame-trace")]
                 last_delivered_callback_count: 0,
@@ -254,6 +310,12 @@ impl DisplayLink {
         unsafe {
             dispatch_source_merge_data(self.frame_requests, 1);
         }
+    }
+
+    /// Mach host time первого и последнего колбэков DisplayLink с предыдущего вызова.
+    /// Кадры, запрошенные через [`Self::request_frame`], сюда не попадают.
+    pub(crate) fn take_pending_ticks(&self) -> Option<(u64, u64)> {
+        self.callback_state.pending_ticks.take()
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -358,6 +420,41 @@ impl Drop for DisplayLink {
         unsafe {
             dispatch_source_cancel(self.frame_requests);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_ticks_from_ns_inverts_the_mach_timebase() {
+        use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
+
+        let mut timebase = mach_timebase_info_data_t { numer: 0, denom: 0 };
+        // SAFETY: timebase is a valid out pointer for mach_timebase_info.
+        assert_eq!(unsafe { mach_timebase_info(&mut timebase) }, 0);
+        let ticks = host_ticks_from_ns(1_000_000).expect("mach timebase is available");
+        let nanoseconds =
+            u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom);
+        // Округление вниз теряет меньше одного тика.
+        let tick_ns = u128::from(timebase.numer).div_ceil(u128::from(timebase.denom));
+        assert!(nanoseconds <= 1_000_000);
+        assert!(1_000_000 - nanoseconds <= tick_ns);
+    }
+
+    #[test]
+    fn pending_ticks_keep_first_and_last_until_taken() {
+        let pending = PendingTicks::default();
+        assert_eq!(pending.take(), None);
+
+        pending.record(10);
+        pending.record(20);
+        assert_eq!(pending.take(), Some((10, 20)));
+        assert_eq!(pending.take(), None);
+
+        pending.record(30);
+        assert_eq!(pending.take(), Some((30, 30)));
     }
 }
 

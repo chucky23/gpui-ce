@@ -1,4 +1,8 @@
-use super::{BoolExt, MacDisplay, NSRange, NSStringExt, ns_string, renderer};
+use super::{
+    BoolExt, MacDisplay, NSRange, NSStringExt,
+    display_link::{host_ticks_from_ns, host_time_now},
+    ns_string, renderer,
+};
 use crate::{
     AnyWindowHandle, Bounds, Capslock, DisplayLink, ExternalPaths, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
@@ -396,6 +400,9 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     display_link: Option<DisplayLink>,
+    // Mach host time начала последнего шага DisplayLink, который вызвал request_frame_callback.
+    // Ноль выключает пропуск устаревших тиков до следующего такого шага.
+    last_step_started: u64,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>>,
@@ -499,6 +506,28 @@ impl MacWindowState {
 
     fn stop_display_link(&mut self) {
         self.display_link = None;
+    }
+
+    fn pending_display_ticks_are_stale(&self, pending_ticks: (u64, u64)) -> bool {
+        #[cfg(not(feature = "macos-blade"))]
+        let (wait_started, wait_finished) = self.renderer.last_drawable_wait();
+        // Blade-рендерер не измеряет ожидание drawable, поэтому тики в нём не пропускаются.
+        #[cfg(feature = "macos-blade")]
+        let (wait_started, wait_finished) = (0, 0);
+        let (Some(min_wait), Some(slack)) = (
+            host_ticks_from_ns(STALE_DISPLAY_TICK_MIN_DRAWABLE_WAIT_NS),
+            host_ticks_from_ns(STALE_DISPLAY_TICK_SLACK_NS),
+        ) else {
+            return false;
+        };
+        display_ticks_are_stale(
+            pending_ticks,
+            self.last_step_started,
+            wait_started,
+            wait_finished,
+            min_wait,
+            slack,
+        )
     }
 
     fn is_maximized(&self) -> bool {
@@ -693,6 +722,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 display_link: None,
+                last_step_started: 0,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -2316,16 +2346,57 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     }
 }
 
+/// Ожидание drawable короче этого порога не считается залипанием фазы кадра.
+const STALE_DISPLAY_TICK_MIN_DRAWABLE_WAIT_NS: u64 = 1_000_000;
+/// Запас, с которым кадр со следующего тика ещё успевает к тому же освобождению drawable.
+const STALE_DISPLAY_TICK_SLACK_NS: u64 = 2_000_000;
+
+/// Решает, устарели ли тики DisplayLink `(first, last)`, накопленные с прошлого шага.
+///
+/// Тики устарели, если все пришли, пока шаг, начатый в `step_started`, ждал nextDrawable не
+/// меньше `min_wait`. Следующий drawable освободится не раньше следующего vsync, поэтому кадр,
+/// начатый сейчас, снова заблокирует главный поток поверх очередного тика. Кадр со следующего
+/// тика успеет к тому же освобождению, если сборка до запроса drawable займёт столько же, сколько
+/// в прошлом шаге: `first + (wait_started - step_started) <= wait_finished + slack`.
+/// Все значения — mach host time.
+fn display_ticks_are_stale(
+    (first, last): (u64, u64),
+    step_started: u64,
+    wait_started: u64,
+    wait_finished: u64,
+    min_wait: u64,
+    slack: u64,
+) -> bool {
+    step_started != 0
+        && step_started <= wait_started
+        && wait_finished.saturating_sub(wait_started) >= min_wait
+        && first >= step_started
+        && last <= wait_finished
+        && first.saturating_add(wait_started - step_started) <= wait_finished.saturating_add(slack)
+}
+
 unsafe extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
 
+    let stale_display_ticks = lock
+        .display_link
+        .as_ref()
+        .and_then(DisplayLink::take_pending_ticks)
+        .is_some_and(|pending_ticks| lock.pending_display_ticks_are_stale(pending_ticks));
+
     #[cfg(feature = "frame-trace")]
     let trace_display_tick = lock
         .display_link
         .as_mut()
-        .and_then(DisplayLink::take_trace_delivery);
+        .and_then(DisplayLink::take_trace_delivery)
+        .map(|mut tick| {
+            if stale_display_ticks {
+                tick.flags |= crate::frame_trace::FLAG_STALE_DISPLAY_TICK_SKIPPED;
+            }
+            tick
+        });
     #[cfg(feature = "frame-trace")]
     if let Some(tick) = trace_display_tick {
         crate::frame_trace::record_display_link_delivery(tick);
@@ -2333,6 +2404,14 @@ unsafe extern "C" fn step(view: *mut c_void) {
 
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
+
+    if stale_display_ticks {
+        // Окно остаётся dirty, и следующий тик нарисует кадр к тому же освобождению drawable
+        // с более свежим вводом. Сброс отметки шага запрещает два пропуска подряд.
+        lock.last_step_started = 0;
+        return;
+    }
+    lock.last_step_started = host_time_now();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
@@ -2849,5 +2928,73 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Время в мс×1e6 от базы: ноль зарезервирован как «шага ещё не было».
+    const BASE: u64 = 100_000_000;
+    const MIN_WAIT: u64 = 1_000_000;
+    const SLACK: u64 = 2_000_000;
+
+    fn at(milliseconds: f64) -> u64 {
+        BASE.checked_add_signed((milliseconds * 1_000_000.0).round() as i64)
+            .expect("test time stays positive")
+    }
+
+    fn stale(ticks: (f64, f64), step_started: f64, wait: (f64, f64)) -> bool {
+        display_ticks_are_stale(
+            (at(ticks.0), at(ticks.1)),
+            at(step_started),
+            at(wait.0),
+            at(wait.1),
+            MIN_WAIT,
+            SLACK,
+        )
+    }
+
+    #[test]
+    fn display_ticks_are_stale_table() {
+        // (а) Режим «вовремя»: тик приходит после конца ожидания.
+        assert!(!stale((9.4, 9.4), 0.0, (1.0, 4.2)));
+        // (б) Поздний режим: тик пришёл во время ожидания.
+        assert!(stale((4.0, 4.0), 0.0, (0.8, 8.2)));
+        // (в) Тяжёлый кадр: ожидание короче порога.
+        assert!(!stale((4.0, 4.0), 0.0, (7.90, 7.95)));
+        // (г) Слитые тики: последний пришёл после конца ожидания.
+        assert!(!stale((4.0, 9.0), 0.0, (0.8, 8.2)));
+        // (д) Поздний режим при сборке 5 мс: 4 + 5 <= 8,2 + 2.
+        assert!(stale((4.0, 4.0), 0.0, (5.0, 8.2)));
+        // Сборка 6 мс уже не успевает к тому же освобождению: 5 + 6 > 8,2 + 2.
+        assert!(!stale((5.0, 5.0), 0.0, (6.0, 8.2)));
+        // (ж) Тик раньше начала шага.
+        assert!(!stale((-1.0, -1.0), 0.0, (0.8, 8.2)));
+        // (з) Последний шаг начался после ожидания и не рисовал.
+        assert!(!stale((12.0, 12.0), 10.0, (0.8, 8.2)));
+    }
+
+    #[test]
+    fn display_ticks_are_not_stale_without_a_measured_step() {
+        // (е) Ожидания ещё не было.
+        assert!(!display_ticks_are_stale(
+            (at(4.0), at(4.0)),
+            at(0.0),
+            0,
+            0,
+            MIN_WAIT,
+            SLACK
+        ));
+        // После пропуска отметка шага сброшена, и следующий тик пропустить нельзя.
+        assert!(!display_ticks_are_stale(
+            (at(4.0), at(4.0)),
+            0,
+            at(0.8),
+            at(8.2),
+            MIN_WAIT,
+            SLACK
+        ));
     }
 }
