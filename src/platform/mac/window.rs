@@ -2353,11 +2353,14 @@ const STALE_DISPLAY_TICK_SLACK_NS: u64 = 2_000_000;
 
 /// Решает, устарели ли тики DisplayLink `(first, last)`, накопленные с прошлого шага.
 ///
-/// Тики устарели, если все пришли, пока шаг, начатый в `step_started`, ждал nextDrawable не
-/// меньше `min_wait`. Следующий drawable освободится не раньше следующего vsync, поэтому кадр,
-/// начатый сейчас, снова заблокирует главный поток поверх очередного тика. Кадр со следующего
-/// тика успеет к тому же освобождению, если сборка до запроса drawable займёт столько же, сколько
-/// в прошлом шаге: `first + (wait_started - step_started) <= wait_finished + slack`.
+/// Тики устарели, если все они пришли после начала шага `step_started` и до конца его ожидания
+/// nextDrawable `wait_finished`, а само ожидание длилось не меньше `min_wait`. Тик мог прийти
+/// и во время сборки кадра, до начала ожидания `wait_started`: шаг всё равно затем простоял на
+/// освобождении drawable. Следующий drawable освободится не раньше следующего vsync, поэтому
+/// кадр, начатый сейчас, снова заблокирует главный поток поверх очередного тика. Кадр со
+/// следующего тика успеет к тому же освобождению, если сборка до запроса drawable займёт
+/// столько же, сколько в прошлом шаге: `first + (wait_started - step_started) <= wait_finished +
+/// slack`. При нулевом `step_started` тики не устарели: см. `step_mark_after`.
 /// Все значения — mach host time.
 fn display_ticks_are_stale(
     (first, last): (u64, u64),
@@ -2373,6 +2376,14 @@ fn display_ticks_are_stale(
         && first >= step_started
         && last <= wait_finished
         && first.saturating_add(wait_started - step_started) <= wait_finished.saturating_add(slack)
+}
+
+/// Возвращает отметку начала шага DisplayLink после решения о накопленных тиках.
+///
+/// Шаг с кадром ставит отметку `now`. Пропуск устаревших тиков сбрасывает её в ноль, а при нулевой
+/// отметке `display_ticks_are_stale` ложно: подряд пропускается не больше одного шага.
+fn step_mark_after(stale: bool, now: u64) -> u64 {
+    if stale { 0 } else { now }
 }
 
 unsafe extern "C" fn step(view: *mut c_void) {
@@ -2405,13 +2416,12 @@ unsafe extern "C" fn step(view: *mut c_void) {
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
 
+    lock.last_step_started = step_mark_after(stale_display_ticks, host_time_now());
     if stale_display_ticks {
         // Окно остаётся dirty, и следующий тик нарисует кадр к тому же освобождению drawable
-        // с более свежим вводом. Сброс отметки шага запрещает два пропуска подряд.
-        lock.last_step_started = 0;
+        // с более свежим вводом.
         return;
     }
-    lock.last_step_started = host_time_now();
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
@@ -2996,5 +3006,31 @@ mod tests {
             MIN_WAIT,
             SLACK
         ));
+    }
+
+    #[test]
+    fn skipped_step_is_not_skipped_again_with_identical_timings() {
+        assert_eq!(step_mark_after(true, at(9.4)), 0);
+        assert_eq!(step_mark_after(false, at(9.4)), at(9.4));
+
+        // Поздний режим (б) повторяется на каждом шаге: тики и ожидание drawable те же, потому что
+        // пропущенный шаг не рисует кадр. Отметка переходит так же, как в `step`.
+        let mut step_started = at(0.0);
+        let skipped: Vec<bool> = (0..3)
+            .map(|_| {
+                let stale = display_ticks_are_stale(
+                    (at(4.0), at(4.0)),
+                    step_started,
+                    at(0.8),
+                    at(8.2),
+                    MIN_WAIT,
+                    SLACK,
+                );
+                step_started = step_mark_after(stale, at(9.4));
+                stale
+            })
+            .collect();
+        assert_eq!(skipped, [true, false, false]);
+        assert_eq!(step_started, at(9.4));
     }
 }

@@ -48,7 +48,10 @@ pub const FLAG_INVALIDATION_DURING_DRAW: u64 = 1 << 11;
 pub const FLAG_DISPLAY_CURRENT_INVALID: u64 = 1 << 12;
 /// A DisplayLink callback did not provide a valid refresh period.
 pub const FLAG_DISPLAY_REFRESH_INVALID: u64 = 1 << 13;
-/// Тик DisplayLink пришёл, пока предыдущий шаг ждал drawable, и был пропущен без кадра.
+/// Шаг DisplayLink пропущен без кадра, потому что накопленные тики устарели: все они пришли
+/// после начала предыдущего шага и до конца его ожидания drawable, то есть во время сборки кадра
+/// или во время самого ожидания. Полное условие — `display_ticks_are_stale`
+/// в `platform/mac/window.rs`.
 pub const FLAG_STALE_DISPLAY_TICK_SKIPPED: u64 = 1 << 14;
 
 static TRACE: OnceLock<FrameTraceBuffer> = OnceLock::new();
