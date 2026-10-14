@@ -3238,6 +3238,33 @@ impl Window {
             .insert_primitive(path.scale(scale_factor));
     }
 
+    /// Закрашивает треугольники `vertices` цветом `color` одним примитивом `Path` в текущем
+    /// порядке отрисовки следующего кадра.
+    ///
+    /// Вершины идут тройками в `Pixels`. Результат совпадает с `paint_path` фигуры, в
+    /// которую те же треугольники добавлены `push_triangle` с `st = (0, 1)` у всех вершин,
+    /// но без промежуточной фигуры и её копии при масштабировании; границы — точный
+    /// описывающий прямоугольник вершин. Пустой срез ничего не рисует.
+    ///
+    /// Вызывается только в фазе paint отрисовки элемента.
+    pub fn paint_triangles(&mut self, vertices: &[Point<Pixels>], color: impl Into<Background>) {
+        self.invalidator.debug_assert_paint();
+        debug_assert_eq!(vertices.len() % 3, 0, "vertices must form whole triangles");
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        let color: Background = color.into();
+        if let Some(path) = Path::<ScaledPixels>::filled_triangles(
+            vertices,
+            scale_factor,
+            content_mask,
+            color.opacity(opacity),
+        ) {
+            self.next_frame.scene.insert_primitive(path);
+        }
+    }
+
     /// Paint an underline into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5546,5 +5573,112 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{self as gpui, TestAppContext, hsla};
+
+    /// Перекрывающиеся слои цвета и треугольников, часть вершин которых лежит за маской.
+    /// Координаты кратны четверти пикселя: на них `Bounds::union` в `push_triangle` не
+    /// накапливает ошибку округления, и границы обоих путей совпадают побитово.
+    fn layers() -> Vec<(Hsla, Vec<Point<Pixels>>)> {
+        let red = hsla(0.0, 0.8, 0.5, 1.0);
+        let blue = hsla(0.6, 0.7, 0.4, 0.75);
+        vec![
+            (
+                red,
+                vec![
+                    point(px(-4.25), px(10.5)),
+                    point(px(30.75), px(12.0)),
+                    point(px(8.5), px(41.25)),
+                    point(px(20.0), px(20.0)),
+                    point(px(150.5), px(25.75)),
+                    point(px(60.25), px(90.0)),
+                ],
+            ),
+            (
+                blue,
+                vec![
+                    point(px(12.0), px(8.25)),
+                    point(px(70.5), px(30.0)),
+                    point(px(15.75), px(55.5)),
+                ],
+            ),
+            (
+                red,
+                vec![
+                    point(px(40.0), px(16.0)),
+                    point(px(52.25), px(64.5)),
+                    point(px(5.5), px(33.75)),
+                ],
+            ),
+        ]
+    }
+
+    /// Фигуры, которые `paint` вывел в сцену следующего кадра для слоёв [`layers`] под маской
+    /// и прозрачностью элемента.
+    fn painted_paths(
+        window: &mut Window,
+        paint: impl Fn(&mut Window, &[Point<Pixels>], Hsla),
+    ) -> Vec<Path<ScaledPixels>> {
+        window.next_frame.scene.clear();
+        window.invalidator.set_phase(DrawPhase::Paint);
+        window.element_opacity = 0.5;
+        let mask = ContentMask {
+            bounds: Bounds::new(point(px(2.5), px(4.0)), size(px(120.0), px(70.25))),
+        };
+        window.with_content_mask(Some(mask), |window| {
+            for (color, vertices) in layers() {
+                paint(window, &vertices, color);
+            }
+        });
+        window.element_opacity = 1.0;
+        window.invalidator.set_phase(DrawPhase::None);
+        window.next_frame.scene.paths.clone()
+    }
+
+    #[gpui::test]
+    fn paint_triangles_matches_paint_path(cx: &mut TestAppContext) {
+        let window_cx = cx.add_empty_window();
+        window_cx.update(|window, _| {
+            let expected = painted_paths(window, |window, vertices, color| {
+                let filled = point(0., 1.);
+                let mut path = Path::new(vertices[0]);
+                for triangle in vertices.chunks_exact(3) {
+                    path.push_triangle(
+                        (triangle[0], triangle[1], triangle[2]),
+                        (filled, filled, filled),
+                    );
+                }
+                window.paint_path(path, color);
+            });
+            let actual = painted_paths(window, |window, vertices, color| {
+                window.paint_triangles(vertices, color)
+            });
+
+            assert_eq!(window.scale_factor(), 2.0);
+            assert_eq!(expected.len(), 3);
+            assert!(
+                expected
+                    .windows(2)
+                    .all(|pair| pair[0].order < pair[1].order)
+            );
+            assert!(expected[0].bounds.origin.x < expected[0].content_mask.bounds.origin.x);
+            pretty_assertions::assert_eq!(format!("{actual:#?}"), format!("{expected:#?}"));
+        });
+    }
+
+    #[gpui::test]
+    fn paint_triangles_without_triangles_paints_nothing(cx: &mut TestAppContext) {
+        let window_cx = cx.add_empty_window();
+        window_cx.update(|window, _| {
+            let paths = painted_paths(window, |window, _, color| {
+                window.paint_triangles(&[], color)
+            });
+            assert!(paths.is_empty());
+        });
     }
 }

@@ -1317,6 +1317,54 @@ impl Path<Pixels> {
     }
 }
 
+impl Path<ScaledPixels> {
+    /// Фигура из закрашенных треугольников `vertices`, масштабированная на `scale_factor`.
+    ///
+    /// Вершины идут тройками, у каждой `st = (0, 1)`; неполная последняя тройка
+    /// отбрасывается. Результат совпадает с фигурой `Path::new` и `push_triangle` этих
+    /// треугольников после `Path::scale`, но вершины переводятся в `ScaledPixels` одним
+    /// проходом в память точного размера, без промежуточной фигуры в `Pixels`. Границы —
+    /// точный описывающий прямоугольник вершин: `push_triangle` наращивает их через
+    /// `Bounds::union`, который на дробных координатах может накопить ошибку округления.
+    /// `None` — ни одного треугольника.
+    pub(crate) fn filled_triangles(
+        vertices: &[Point<Pixels>],
+        scale_factor: f32,
+        content_mask: ContentMask<Pixels>,
+        color: Background,
+    ) -> Option<Self> {
+        let vertices = &vertices[..vertices.len() - vertices.len() % 3];
+        let first = *vertices.first()?;
+        let mut top_left = first;
+        let mut bottom_right = first;
+        let filled = point(0., 1.);
+        let scaled_vertices = vertices
+            .iter()
+            .map(|vertex| {
+                top_left = top_left.min(vertex);
+                bottom_right = bottom_right.max(vertex);
+                PathVertex {
+                    xy_position: vertex.scale(scale_factor),
+                    st_position: filled,
+                    content_mask: ContentMask::default(),
+                }
+            })
+            .collect();
+        let start = first.scale(scale_factor);
+        Some(Path {
+            id: PathId(0),
+            order: DrawOrder::default(),
+            bounds: Bounds::from_corners(top_left, bottom_right).scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            vertices: scaled_vertices,
+            color,
+            start,
+            current: start,
+            contour_count: 0,
+        })
+    }
+}
+
 impl<T> Path<T>
 where
     T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
