@@ -181,6 +181,41 @@ fn project_frame_trace_capture_level(
     }
 }
 
+/// Потребители `Reference` и `Detailed` ждут ноль в `next_drawable_wait_ns` отправки:
+/// в Detailed ожидание несёт `DrawableAcquired`.
+#[cfg(feature = "frame-trace")]
+fn project_frame_trace_submission_timing(
+    event: &mut crate::frame_trace::FrameTraceEvent,
+    reference_timed: bool,
+    next_drawable_wait_ns: u64,
+) {
+    if reference_timed {
+        event.next_drawable_wait_ns = next_drawable_wait_ns;
+    }
+}
+
+/// Интервал GPU корневого command buffer в событии показа; в Detailed его несёт
+/// `GpuCompleted`, поэтому правила валидности те же.
+#[cfg(feature = "frame-trace")]
+fn project_frame_trace_gpu_interval(
+    event: &mut crate::frame_trace::FrameTraceEvent,
+    reference_timed: bool,
+    gpu_start_seconds: f64,
+    gpu_end_seconds: f64,
+) {
+    if !reference_timed {
+        return;
+    }
+    event.gpu_start_time_ns = crate::frame_trace::host_seconds_to_ns(gpu_start_seconds);
+    event.gpu_end_time_ns = crate::frame_trace::host_seconds_to_ns(gpu_end_seconds);
+    if event.gpu_start_time_ns == 0
+        || event.gpu_end_time_ns == 0
+        || event.gpu_end_time_ns < event.gpu_start_time_ns
+    {
+        event.flags |= crate::frame_trace::FLAG_GPU_TIMESTAMPS_INVALID;
+    }
+}
+
 #[cfg(feature = "frame-trace")]
 fn frame_trace_presentation_event(
     mut event: crate::frame_trace::FrameTraceEvent,
@@ -1237,6 +1272,8 @@ impl MetalRenderer {
         #[cfg(feature = "frame-trace")]
         let frame_trace_detailed = crate::frame_trace::is_detailed_enabled();
         #[cfg(feature = "frame-trace")]
+        let frame_trace_reference_timed = crate::frame_trace::is_reference_timing_enabled();
+        #[cfg(feature = "frame-trace")]
         let next_drawable_started_ns =
             crate::frame_trace::is_enabled().then(crate::frame_trace::monotonic_time_ns);
         #[cfg(feature = "frame-trace")]
@@ -1270,17 +1307,20 @@ impl MetalRenderer {
             return;
         };
         #[cfg(feature = "frame-trace")]
-        if let Some(next_drawable_started_ns) = next_drawable_started_ns {
-            let mut event = self.frame_trace_event(
-                crate::frame_trace::FrameTraceEventKind::DrawableAcquired,
-                scene,
-                crate::frame_trace::encode_drawable_id(drawable.drawable_id() as u64),
-                0,
-            );
-            event.next_drawable_wait_ns =
-                event.timestamp_ns.saturating_sub(next_drawable_started_ns);
-            crate::frame_trace::record(event);
-        }
+        let trace_next_drawable_wait_ns = next_drawable_started_ns
+            .map(|next_drawable_started_ns| {
+                let mut event = self.frame_trace_event(
+                    crate::frame_trace::FrameTraceEventKind::DrawableAcquired,
+                    scene,
+                    crate::frame_trace::encode_drawable_id(drawable.drawable_id() as u64),
+                    0,
+                );
+                event.next_drawable_wait_ns =
+                    event.timestamp_ns.saturating_sub(next_drawable_started_ns);
+                crate::frame_trace::record(event);
+                event.next_drawable_wait_ns
+            })
+            .unwrap_or_default();
 
         loop {
             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
@@ -1328,6 +1368,11 @@ impl MetalRenderer {
                             let callback_observed_ns = crate::frame_trace::monotonic_time_ns();
                             #[cfg(feature = "frame-trace")]
                             let presented_time_seconds = presented_drawable.presented_time();
+                            let gpu_start: f64 = unsafe {
+                                msg_send![measured_command_buffer.as_ref(), GPUStartTime]
+                            };
+                            let gpu_end: f64 =
+                                unsafe { msg_send![measured_command_buffer.as_ref(), GPUEndTime] };
                             #[cfg(feature = "frame-trace")]
                             {
                                 let presented_time_ns =
@@ -1337,20 +1382,21 @@ impl MetalRenderer {
                                         Some(depth.saturating_sub(1))
                                     })
                                     .unwrap_or_default();
-                                let event = frame_trace_presentation_event(
+                                let mut event = frame_trace_presentation_event(
                                     trace_presented_event,
                                     presented_time_ns,
                                     callback_observed_ns,
                                     presented_drawable.drawable_id(),
                                     previous_queue_depth,
                                 );
+                                project_frame_trace_gpu_interval(
+                                    &mut event,
+                                    frame_trace_reference_timed,
+                                    gpu_start,
+                                    gpu_end,
+                                );
                                 crate::frame_trace::record(event);
                             }
-                            let gpu_start: f64 = unsafe {
-                                msg_send![measured_command_buffer.as_ref(), GPUStartTime]
-                            };
-                            let gpu_end: f64 =
-                                unsafe { msg_send![measured_command_buffer.as_ref(), GPUEndTime] };
                             let gpu_duration = (gpu_start > 0. && gpu_end >= gpu_start)
                                 .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
                             #[cfg(not(feature = "frame-trace"))]
@@ -1402,6 +1448,11 @@ impl MetalRenderer {
                         {
                             event.flags |= crate::frame_trace::FLAG_MISSED_DISPLAY_TARGET;
                         }
+                        project_frame_trace_submission_timing(
+                            &mut event,
+                            frame_trace_reference_timed,
+                            trace_next_drawable_wait_ns,
+                        );
                         event
                     };
 
@@ -3403,6 +3454,61 @@ mod raster_comparison_tests {
         event.coalesced_display_tick_count = 3;
         project_frame_trace_capture_level(&mut event, true);
         assert_eq!(event.coalesced_display_tick_count, 3);
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn reference_timed_capture_fills_frame_timing_fields() {
+        use crate::frame_trace::{
+            FLAG_GPU_TIMESTAMPS_INVALID, FrameTraceEvent, FrameTraceEventKind,
+        };
+
+        let mut scene = Scene::default();
+        scene.set_frame_trace_correlation(5, 0, None);
+        scene.set_frame_trace_logical_frame_started_ns(1_000);
+
+        for reference_timed in [false, true] {
+            let mut submitted = FrameTraceEvent::now(FrameTraceEventKind::CommandBufferSubmitted);
+            scene.populate_frame_trace_event(&mut submitted);
+            project_frame_trace_submission_timing(&mut submitted, reference_timed, 250);
+            assert_eq!(submitted.logical_frame_started_ns, 1_000);
+            assert_eq!(
+                submitted.next_drawable_wait_ns,
+                if reference_timed { 250 } else { 0 }
+            );
+
+            let mut template = FrameTraceEvent::now(FrameTraceEventKind::DrawablePresented);
+            scene.populate_frame_trace_event(&mut template);
+            let mut presented = frame_trace_presentation_event(template, 3_000, 3_100, 0, 1);
+            project_frame_trace_gpu_interval(&mut presented, reference_timed, 1.25, 1.5);
+            assert_eq!(presented.kind, FrameTraceEventKind::DrawablePresented);
+            assert_eq!(presented.logical_frame_started_ns, 1_000);
+            assert_eq!(presented.next_drawable_wait_ns, 0);
+            if reference_timed {
+                assert_eq!(presented.gpu_start_time_ns, 1_250_000_000);
+                assert_eq!(presented.gpu_end_time_ns, 1_500_000_000);
+            } else {
+                assert_eq!(presented.gpu_start_time_ns, 0);
+                assert_eq!(presented.gpu_end_time_ns, 0);
+            }
+            assert_eq!(presented.flags & FLAG_GPU_TIMESTAMPS_INVALID, 0);
+        }
+
+        for (gpu_start_seconds, gpu_end_seconds) in [(0.0, 1.5), (1.5, 0.0), (1.5, 1.25)] {
+            let mut dropped = FrameTraceEvent::now(FrameTraceEventKind::DrawableDropped);
+            project_frame_trace_gpu_interval(
+                &mut dropped,
+                true,
+                gpu_start_seconds,
+                gpu_end_seconds,
+            );
+            assert_ne!(dropped.flags & FLAG_GPU_TIMESTAMPS_INVALID, 0);
+        }
+
+        scene.clear();
+        let mut submitted = FrameTraceEvent::now(FrameTraceEventKind::CommandBufferSubmitted);
+        scene.populate_frame_trace_event(&mut submitted);
+        assert_eq!(submitted.logical_frame_started_ns, 0);
     }
 
     #[cfg(feature = "frame-trace")]

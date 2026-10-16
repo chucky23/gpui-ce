@@ -59,6 +59,7 @@ static NEXT_RENDERER_INSTANCE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_COMMAND_BUFFER_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISPLAY_TICK_SEQUENCE_ID: AtomicU64 = AtomicU64::new(0);
 static DETAILED_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+static REFERENCE_TIMING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static CURRENT_APPKIT_INPUT_SEQUENCE_ID: Cell<u64> = const { Cell::new(0) };
@@ -171,6 +172,14 @@ pub enum FrameSubmissionSkipReason {
 pub enum FrameTraceCaptureLevel {
     /// Retains only the direct input, submission, and presentation chain.
     Reference,
+    /// Хранит те же виды событий, что `Reference`, и дополнительно заполняет в них
+    /// время CPU и GPU кадра: `logical_frame_started_ns` во всех событиях кадра,
+    /// `next_drawable_wait_ns` у `CommandBufferSubmitted`, `gpu_start_time_ns` и
+    /// `gpu_end_time_ns` у `DrawablePresented` и `DrawableDropped`.
+    ///
+    /// Отдельный уровень нужен потому, что потребители `Reference` требуют нулей в
+    /// этих полях; их вывод при этом не меняется.
+    ReferenceTimed,
     /// Retains every diagnostic stage in the frame trace.
     Detailed,
 }
@@ -395,6 +404,12 @@ pub struct FrameTraceEvent {
     pub gpu_start_time_ns: u64,
     /// Absolute Metal `GPUEndTime`, when known.
     pub gpu_end_time_ns: u64,
+    /// Вход в `Window::draw` логического кадра, чью сцену несёт событие, на часах
+    /// [`monotonic_time_ns`]. Заполняется только уровнем
+    /// [`FrameTraceCaptureLevel::ReferenceTimed`]; ноль в JSON не выводится, поэтому
+    /// вывод `Reference` и `Detailed` побайтно прежний.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub logical_frame_started_ns: u64,
     /// Causal Canvas token, absent for non-Canvas scenes and process-level events.
     pub presentation_token: Option<PresentationToken>,
     /// Closed numeric [`FrameSubmissionSkipReason`], or zero for submitted events.
@@ -464,6 +479,7 @@ impl FrameTraceEvent {
             next_drawable_wait_ns: 0,
             gpu_start_time_ns: 0,
             gpu_end_time_ns: 0,
+            logical_frame_started_ns: 0,
             presentation_token: None,
             submission_skip_reason: 0,
             shadow_count: 0,
@@ -657,6 +673,10 @@ pub fn start_with_level(capacity: usize, level: FrameTraceCaptureLevel, run_id_h
     }
     ACTIVE_RUN_ID_HASH.store(run_id_hash, Ordering::Release);
     DETAILED_CAPTURE_ENABLED.store(level == FrameTraceCaptureLevel::Detailed, Ordering::Release);
+    REFERENCE_TIMING_ENABLED.store(
+        level == FrameTraceCaptureLevel::ReferenceTimed,
+        Ordering::Release,
+    );
     record(FrameTraceEvent::now(FrameTraceEventKind::TraceStarted));
     true
 }
@@ -675,6 +695,7 @@ pub fn record(event: FrameTraceEvent) {
 pub fn stop_and_snapshot() -> Option<FrameTraceSnapshot> {
     let trace = TRACE.get()?;
     DETAILED_CAPTURE_ENABLED.store(false, Ordering::Release);
+    REFERENCE_TIMING_ENABLED.store(false, Ordering::Release);
     let snapshot = trace.stop_and_snapshot();
     ACTIVE_RUN_ID_HASH.store(0, Ordering::Release);
     snapshot
@@ -695,6 +716,16 @@ pub fn is_enabled() -> bool {
 #[inline]
 pub fn is_detailed_enabled() -> bool {
     DETAILED_CAPTURE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Returns whether `ReferenceTimed` frame-timing fields are being filled.
+#[inline]
+pub fn is_reference_timing_enabled() -> bool {
+    REFERENCE_TIMING_ENABLED.load(Ordering::Relaxed)
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Records a native or synthetic input and returns its unique sequence identifier.
@@ -962,6 +993,24 @@ mod tests {
         assert!(!is_enabled());
         assert_eq!(active_run_id_hash(), 0);
         assert!(!is_detailed_enabled());
+    }
+
+    #[test]
+    fn zero_logical_frame_start_keeps_the_existing_json_shape() {
+        let mut event = FrameTraceEvent::now(FrameTraceEventKind::CommandBufferSubmitted);
+        let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(event) else {
+            panic!("trace event must serialize to a JSON object");
+        };
+        // 52 поля — схема события input-frame-present-trace-v2 в Chora.
+        assert_eq!(fields.len(), 52);
+        assert!(!fields.contains_key("logical_frame_started_ns"));
+
+        event.logical_frame_started_ns = 41;
+        let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(event) else {
+            panic!("trace event must serialize to a JSON object");
+        };
+        assert_eq!(fields.len(), 53);
+        assert_eq!(fields["logical_frame_started_ns"], serde_json::json!(41));
     }
 
     #[test]

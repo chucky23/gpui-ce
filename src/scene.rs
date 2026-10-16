@@ -50,6 +50,8 @@ pub(crate) struct Scene {
     #[cfg(feature = "frame-trace")]
     pub(crate) frame_trace_gpui_window_frame_id: u64,
     #[cfg(feature = "frame-trace")]
+    frame_trace_logical_frame_started_ns: u64,
+    #[cfg(feature = "frame-trace")]
     frame_trace_summary: crate::frame_trace::FrameTraceSceneSummary,
     #[cfg(feature = "frame-trace")]
     frame_trace_diagnostic_hold_ticks: u8,
@@ -81,6 +83,7 @@ impl Scene {
             self.frame_trace_scene_build_tick = None;
             self.frame_trace_presentation_tick = None;
             self.frame_trace_gpui_window_frame_id = 0;
+            self.frame_trace_logical_frame_started_ns = 0;
             self.frame_trace_summary = Default::default();
             self.frame_trace_diagnostic_hold_ticks = 0;
             self.frame_trace_last_held_tick_sequence = 0;
@@ -97,6 +100,11 @@ impl Scene {
         self.frame_trace_logical_frame_id = logical_frame_id;
         self.frame_trace_input_sequence_id = input_sequence_id;
         self.frame_trace_scene_build_tick = scene_build_tick;
+    }
+
+    #[cfg(feature = "frame-trace")]
+    pub(crate) fn set_frame_trace_logical_frame_started_ns(&mut self, started_ns: u64) {
+        self.frame_trace_logical_frame_started_ns = started_ns;
     }
 
     #[cfg(feature = "frame-trace")]
@@ -148,6 +156,7 @@ impl Scene {
         event.input_sequence_id = self.frame_trace_input_sequence_id;
         event.gpui_window_frame_id = self.frame_trace_gpui_window_frame_id;
         event.presentation_token = self.frame_trace_presentation_token;
+        event.logical_frame_started_ns = self.frame_trace_logical_frame_started_ns;
         if let Some(tick) = self.frame_trace_scene_build_tick {
             event.display_id = u64::from(tick.display_id);
             event.scene_build_display_tick_sequence = tick.sequence;

@@ -2196,6 +2196,15 @@ impl Window {
                 self.frame_trace_input_sequence_id,
                 self.frame_trace_display_tick.get(),
             );
+            // Тот же момент, что `LogicalFrameStarted` в Detailed: так CPU-время кадра
+            // по `ReferenceTimed` и по Detailed считается от одной точки.
+            if crate::frame_trace::is_reference_timing_enabled() {
+                self.next_frame
+                    .scene
+                    .set_frame_trace_logical_frame_started_ns(
+                        crate::frame_trace::monotonic_time_ns(),
+                    );
+            }
             record_frame_trace_scene_event(
                 crate::frame_trace::FrameTraceEventKind::LogicalFrameStarted,
                 &self.next_frame.scene,
