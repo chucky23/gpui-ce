@@ -30,7 +30,6 @@ use metal::{
 use objc::{self, class, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-#[cfg(feature = "frame-trace")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     cell::Cell,
@@ -268,6 +267,8 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+/// Сколько раз подряд показывать заново сцену, чей последний drawable Metal отбросил.
+const MAX_DROPPED_FRAME_REPRESENTS: u64 = 3;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -642,6 +643,14 @@ pub(crate) struct MetalRenderer {
     frame_index: u64,
     presented_frame_samples: Arc<Mutex<Vec<FramePresentationSample>>>,
     raster_compositor_presentation_samples: Arc<Mutex<Vec<RasterCompositorPresentationSample>>>,
+    /// Номер последнего кадра основного слоя, отправленного на показ.
+    last_submitted_frame: Arc<AtomicU64>,
+    /// Номер кадра, чей drawable Metal отбросил, не показав, когда новее ничего не отправлено.
+    /// Ноль — повторный показ не нужен.
+    dropped_latest_frame: Arc<AtomicU64>,
+    /// Сколько последних кадров подряд отброшено. Сбрасывается любым показанным кадром и
+    /// ограничивает повторы, чтобы скрытое окно не перерисовывалось на каждом такте.
+    consecutive_dropped_frames: Arc<AtomicU64>,
     #[cfg(feature = "frame-trace")]
     frame_trace_renderer_instance_id: u64,
     #[cfg(feature = "frame-trace")]
@@ -908,6 +917,9 @@ impl MetalRenderer {
             frame_index: 0,
             presented_frame_samples: Arc::new(Mutex::new(Vec::new())),
             raster_compositor_presentation_samples: Arc::new(Mutex::new(Vec::new())),
+            last_submitted_frame: Arc::new(AtomicU64::new(0)),
+            dropped_latest_frame: Arc::new(AtomicU64::new(0)),
+            consecutive_dropped_frames: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "frame-trace")]
             frame_trace_renderer_instance_id: crate::frame_trace::next_renderer_instance_id(),
             #[cfg(feature = "frame-trace")]
@@ -1062,6 +1074,12 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// Metal отбросил drawable последнего отправленного кадра, и новее ничего не отправлено:
+    /// на экране остался предыдущий кадр, и сцену нужно показать ещё раз. Сбрасывает признак.
+    pub fn take_dropped_latest_frame(&self) -> bool {
+        self.dropped_latest_frame.swap(0, Ordering::AcqRel) != 0
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -1343,6 +1361,9 @@ impl MetalRenderer {
                     let frame_id = self.frame_index;
                     let submitted_at = Instant::now();
                     let samples = self.presented_frame_samples.clone();
+                    let last_submitted_frame = self.last_submitted_frame.clone();
+                    let dropped_latest_frame = self.dropped_latest_frame.clone();
+                    let consecutive_dropped_frames = self.consecutive_dropped_frames.clone();
                     let measured_command_buffer = command_buffer.to_owned();
                     #[cfg(feature = "frame-trace")]
                     let trace_drawable_id =
@@ -1364,6 +1385,16 @@ impl MetalRenderer {
                         self.frame_trace_presentation_queue_depth.clone();
                     let presented =
                         ConcreteBlock::new(move |presented_drawable: &metal::DrawableRef| {
+                            // presentedTime == 0: drawable отброшен. Если это последний отправленный
+                            // кадр, его содержимое так и не попадёт на экран без повторного показа.
+                            if presented_drawable.presented_time() > 0. {
+                                consecutive_dropped_frames.store(0, Ordering::Release);
+                            } else if last_submitted_frame.load(Ordering::Acquire) == frame_id
+                                && consecutive_dropped_frames.fetch_add(1, Ordering::AcqRel)
+                                    < MAX_DROPPED_FRAME_REPRESENTS
+                            {
+                                dropped_latest_frame.store(frame_id, Ordering::Release);
+                            }
                             #[cfg(feature = "frame-trace")]
                             let callback_observed_ns = crate::frame_trace::monotonic_time_ns();
                             #[cfg(feature = "frame-trace")]
@@ -1428,6 +1459,7 @@ impl MetalRenderer {
                         });
                     let presented = presented.copy();
                     drawable.add_presented_handler(&presented);
+                    self.last_submitted_frame.store(frame_id, Ordering::Release);
 
                     #[cfg(feature = "frame-trace")]
                     let prepare_submission_event = || {

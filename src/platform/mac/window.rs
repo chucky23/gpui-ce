@@ -2334,15 +2334,26 @@ unsafe extern "C" fn step(view: *mut c_void) {
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
 
+    // Metal отбросил drawable последнего кадра, а новее ничего не отправлено: без повторного
+    // показа на экране останется предыдущий кадр до следующего изменения сцены.
+    #[cfg(not(feature = "macos-blade"))]
+    let require_presentation = lock.renderer.take_dropped_latest_frame();
+    #[cfg(feature = "macos-blade")]
+    let require_presentation = false;
+
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         #[cfg(feature = "frame-trace")]
         callback(RequestFrameOptions {
+            require_presentation,
             trace_display_tick,
             ..Default::default()
         });
         #[cfg(not(feature = "frame-trace"))]
-        callback(Default::default());
+        callback(RequestFrameOptions {
+            require_presentation,
+            ..Default::default()
+        });
         window_state.lock().request_frame_callback = Some(callback);
     }
 }
