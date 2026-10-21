@@ -48,6 +48,43 @@ const FRAME_TRACE_COMMAND_METADATA_SLOTS: usize = 64;
 #[cfg(feature = "frame-trace")]
 const FRAME_TRACE_COMMAND_METADATA_FIELDS: usize = 25;
 
+/// Глубина очереди показа корневого слоя для трассы кадра.
+///
+/// Отправка увеличивает глубину, обработчик показа уменьшает её на другом потоке, а номер
+/// события выдаётся только при записи. Изменение глубины и запись события выполняются под одной
+/// блокировкой, поэтому порядок номеров событий совпадает с порядком изменений глубины.
+#[cfg(feature = "frame-trace")]
+#[derive(Default)]
+struct PresentationQueueTrace {
+    depth: AtomicU64,
+    order: Mutex<()>,
+}
+
+#[cfg(feature = "frame-trace")]
+impl PresentationQueueTrace {
+    fn depth(&self) -> u64 {
+        self.depth.load(Ordering::Acquire)
+    }
+
+    /// Увеличивает глубину и возвращает её с блокировкой, которую нужно держать до записи
+    /// события отправки.
+    fn begin_submission(&self) -> (parking_lot::MutexGuard<'_, ()>, u64) {
+        let guard = self.order.lock();
+        let depth = self.depth.fetch_add(1, Ordering::AcqRel) + 1;
+        (guard, depth)
+    }
+
+    /// Уменьшает глубину и под той же блокировкой записывает показ: `record` получает глубину
+    /// до показа.
+    fn record_presentation(&self, record: impl FnOnce(u64)) {
+        let _guard = self.order.lock();
+        let previous = self.depth.load(Ordering::Acquire);
+        self.depth
+            .store(previous.saturating_sub(1), Ordering::Release);
+        record(previous);
+    }
+}
+
 #[cfg(feature = "frame-trace")]
 struct FrameTraceCommandMetadataSlot {
     command_buffer_key: AtomicU64,
@@ -700,7 +737,7 @@ pub(crate) struct MetalRenderer {
     #[cfg(feature = "frame-trace")]
     frame_trace_renderer_instance_id: u64,
     #[cfg(feature = "frame-trace")]
-    frame_trace_presentation_queue_depth: Arc<AtomicU64>,
+    frame_trace_presentation_queue: Arc<PresentationQueueTrace>,
     #[cfg(feature = "frame-trace")]
     frame_trace_command_metadata: Arc<FrameTraceCommandMetadataTable>,
     #[cfg(feature = "frame-trace")]
@@ -874,12 +911,12 @@ impl MetalRenderer {
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
         #[cfg(feature = "frame-trace")]
-        let frame_trace_presentation_queue_depth = Arc::new(AtomicU64::new(0));
+        let frame_trace_presentation_queue = Arc::new(PresentationQueueTrace::default());
         #[cfg(feature = "frame-trace")]
         let frame_trace_command_metadata = Arc::new(FrameTraceCommandMetadataTable::new());
         #[cfg(feature = "frame-trace")]
         let frame_trace_scheduled_handler = ConcreteBlock::new({
-            let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
+            let presentation_queue = frame_trace_presentation_queue.clone();
             let command_metadata = frame_trace_command_metadata.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
                 if !crate::frame_trace::is_detailed_enabled() {
@@ -890,14 +927,14 @@ impl MetalRenderer {
                 );
                 event.command_buffer_id = command_buffer.as_ptr() as usize as u64;
                 command_metadata.populate(event.command_buffer_id, &mut event);
-                event.presentation_queue_depth = presentation_queue_depth.load(Ordering::Acquire);
+                event.presentation_queue_depth = presentation_queue.depth();
                 crate::frame_trace::record(event);
             }
         })
         .copy();
         #[cfg(feature = "frame-trace")]
         let frame_trace_completed_handler = ConcreteBlock::new({
-            let presentation_queue_depth = frame_trace_presentation_queue_depth.clone();
+            let presentation_queue = frame_trace_presentation_queue.clone();
             let command_metadata = frame_trace_command_metadata.clone();
             move |command_buffer: &'static metal::CommandBufferRef| {
                 let command_buffer_key = command_buffer.as_ptr() as usize as u64;
@@ -922,7 +959,7 @@ impl MetalRenderer {
                 event.command_buffer_id = command_buffer_key;
                 command_metadata.populate(event.command_buffer_id, &mut event);
                 command_metadata.remove(command_buffer_key);
-                event.presentation_queue_depth = presentation_queue_depth.load(Ordering::Acquire);
+                event.presentation_queue_depth = presentation_queue.depth();
                 event.gpu_start_time_ns = gpu_start_time_ns;
                 event.gpu_end_time_ns = gpu_end_time_ns;
                 if gpu_start_time_ns == 0
@@ -974,7 +1011,7 @@ impl MetalRenderer {
             #[cfg(feature = "frame-trace")]
             frame_trace_renderer_instance_id: crate::frame_trace::next_renderer_instance_id(),
             #[cfg(feature = "frame-trace")]
-            frame_trace_presentation_queue_depth,
+            frame_trace_presentation_queue,
             #[cfg(feature = "frame-trace")]
             frame_trace_scheduled_handler,
             #[cfg(feature = "frame-trace")]
@@ -1001,9 +1038,7 @@ impl MetalRenderer {
         event.renderer_frame_id = self.frame_index;
         event.drawable_id = drawable_id;
         event.command_buffer_id = command_buffer_id;
-        event.presentation_queue_depth = self
-            .frame_trace_presentation_queue_depth
-            .load(Ordering::Acquire);
+        event.presentation_queue_depth = self.frame_trace_presentation_queue.depth();
         if scene.frame_trace_logical_frame_id != 0
             && scene.frame_trace_logical_frame_id == self.frame_trace_last_logical_frame_id
         {
@@ -1487,8 +1522,7 @@ impl MetalRenderer {
                         command_buffer.add_completed_handler(&self.frame_trace_completed_handler);
                     }
                     #[cfg(feature = "frame-trace")]
-                    let trace_presentation_queue_depth =
-                        self.frame_trace_presentation_queue_depth.clone();
+                    let trace_presentation_queue = self.frame_trace_presentation_queue.clone();
                     let presented =
                         ConcreteBlock::new(move |presented_drawable: &metal::DrawableRef| {
                             // presentedTime == 0: drawable отброшен. Если это последний отправленный
@@ -1514,25 +1548,24 @@ impl MetalRenderer {
                             {
                                 let presented_time_ns =
                                     crate::frame_trace::host_seconds_to_ns(presented_time_seconds);
-                                let previous_queue_depth = trace_presentation_queue_depth
-                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                                        Some(depth.saturating_sub(1))
-                                    })
-                                    .unwrap_or_default();
-                                let mut event = frame_trace_presentation_event(
-                                    trace_presented_event,
-                                    presented_time_ns,
-                                    callback_observed_ns,
-                                    presented_drawable.drawable_id(),
-                                    previous_queue_depth,
+                                trace_presentation_queue.record_presentation(
+                                    |previous_queue_depth| {
+                                        let mut event = frame_trace_presentation_event(
+                                            trace_presented_event,
+                                            presented_time_ns,
+                                            callback_observed_ns,
+                                            presented_drawable.drawable_id(),
+                                            previous_queue_depth,
+                                        );
+                                        project_frame_trace_gpu_interval(
+                                            &mut event,
+                                            frame_trace_reference_timed,
+                                            gpu_start,
+                                            gpu_end,
+                                        );
+                                        crate::frame_trace::record(event);
+                                    },
                                 );
-                                project_frame_trace_gpu_interval(
-                                    &mut event,
-                                    frame_trace_reference_timed,
-                                    gpu_start,
-                                    gpu_end,
-                                );
-                                crate::frame_trace::record(event);
                             }
                             let gpu_duration = (gpu_start > 0. && gpu_end >= gpu_start)
                                 .then(|| Duration::from_secs_f64(gpu_end - gpu_start));
@@ -1568,11 +1601,13 @@ impl MetalRenderer {
                     self.last_submitted_frame.store(frame_id, Ordering::Release);
 
                     #[cfg(feature = "frame-trace")]
+                    let trace_presentation_queue = self.frame_trace_presentation_queue.clone();
+                    // Блокировка очереди держится до записи события отправки: обработчик показа
+                    // более раннего кадра не получит номер события между ними.
+                    #[cfg(feature = "frame-trace")]
                     let prepare_submission_event = || {
-                        let queue_depth = self
-                            .frame_trace_presentation_queue_depth
-                            .fetch_add(1, Ordering::AcqRel)
-                            + 1;
+                        let (queue_order, queue_depth) =
+                            trace_presentation_queue.begin_submission();
                         let mut event = self.frame_trace_event(
                             crate::frame_trace::FrameTraceEventKind::CommandBufferSubmitted,
                             scene,
@@ -1591,12 +1626,12 @@ impl MetalRenderer {
                             frame_trace_reference_timed,
                             trace_next_drawable_wait_ns,
                         );
-                        event
+                        (queue_order, event)
                     };
 
                     if self.presents_with_transaction {
                         #[cfg(feature = "frame-trace")]
-                        let submitted_event = prepare_submission_event();
+                        let (queue_order, submitted_event) = prepare_submission_event();
                         #[cfg(feature = "frame-trace")]
                         if frame_trace_detailed {
                             self.frame_trace_command_metadata.register(
@@ -1608,6 +1643,7 @@ impl MetalRenderer {
                         #[cfg(feature = "frame-trace")]
                         {
                             crate::frame_trace::record(submitted_event);
+                            drop(queue_order);
                             if frame_trace_detailed {
                                 crate::frame_trace::record(self.frame_trace_event(
                                     crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
@@ -1622,7 +1658,7 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         #[cfg(feature = "frame-trace")]
-                        let submitted_event = prepare_submission_event();
+                        let (queue_order, submitted_event) = prepare_submission_event();
                         #[cfg(feature = "frame-trace")]
                         if frame_trace_detailed {
                             self.frame_trace_command_metadata.register(
@@ -1634,6 +1670,7 @@ impl MetalRenderer {
                         #[cfg(feature = "frame-trace")]
                         {
                             crate::frame_trace::record(submitted_event);
+                            drop(queue_order);
                             if frame_trace_detailed {
                                 crate::frame_trace::record(self.frame_trace_event(
                                     crate::frame_trace::FrameTraceEventKind::CommandBufferCommitReturned,
@@ -3889,6 +3926,64 @@ mod raster_comparison_tests {
             dropped.flags & crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH,
             0
         );
+    }
+
+    #[cfg(feature = "frame-trace")]
+    #[test]
+    fn presentation_queue_depth_follows_event_order_across_threads() {
+        use std::sync::mpsc;
+
+        #[derive(Clone, Copy)]
+        enum Change {
+            Submitted(u64),
+            Presented(u64),
+        }
+        const FRAMES: usize = 20_000;
+        let queue = Arc::new(PresentationQueueTrace::default());
+        let sequence = Arc::new(AtomicU64::new(0));
+        let log = Arc::new(Mutex::new(Vec::with_capacity(FRAMES * 2)));
+        let (submitted, presentable) = mpsc::channel::<()>();
+        let presenter = std::thread::spawn({
+            let queue = queue.clone();
+            let sequence = sequence.clone();
+            let log = log.clone();
+            move || {
+                for () in presentable {
+                    queue.record_presentation(|previous| {
+                        let id = sequence.fetch_add(1, Ordering::SeqCst);
+                        log.lock().push((id, Change::Presented(previous)));
+                    });
+                }
+            }
+        });
+        for _ in 0..FRAMES {
+            let (order, depth) = queue.begin_submission();
+            submitted.send(()).expect("presenter is running");
+            // Показ уже может ждать блокировку: номер события отправки выдаётся раньше.
+            std::thread::yield_now();
+            let id = sequence.fetch_add(1, Ordering::SeqCst);
+            log.lock().push((id, Change::Submitted(depth)));
+            drop(order);
+        }
+        drop(submitted);
+        presenter.join().expect("presenter thread");
+
+        let mut log = log.lock().clone();
+        log.sort_by_key(|(id, _)| *id);
+        let mut depth = 0_u64;
+        for (id, change) in log {
+            match change {
+                Change::Submitted(recorded) => {
+                    depth += 1;
+                    assert_eq!(recorded, depth, "submission event {id}");
+                }
+                Change::Presented(previous) => {
+                    assert_eq!(previous, depth, "presentation event {id}");
+                    depth -= 1;
+                }
+            }
+        }
+        assert_eq!(depth, 0);
     }
 
     #[test]
