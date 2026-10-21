@@ -1869,6 +1869,30 @@ impl MetalRenderer {
             (None, None)
         };
 
+        let path_plan = self.plan_path_passes(scene, viewport);
+        // Первый проход путей идёт до основного: пакеты, которым он подходит, наносятся на кадр
+        // без разрыва основного прохода.
+        let mut rasterized_path_passes = 0;
+        if let Some(first) = path_plan.passes.first() {
+            if !self.draw_paths_to_intermediate(
+                first,
+                instance_buffer,
+                instance_offset,
+                viewport,
+                command_buffer,
+                path_intermediate.as_ref(),
+                path_intermediate_msaa.as_ref(),
+            ) {
+                anyhow::bail!(
+                    "scene too large at paths: offset={} capacity={}; {} paths",
+                    *instance_offset,
+                    instance_buffer.size,
+                    scene.paths.len(),
+                );
+            }
+            rasterized_path_passes = 1;
+        }
+
         let mut command_encoder =
             new_command_encoder(command_buffer, target, viewport, |color_attachment| {
                 color_attachment.set_load_action(metal::MTLLoadAction::Clear);
@@ -1880,7 +1904,7 @@ impl MetalRenderer {
                 ));
             });
 
-        for batch in scene.batches() {
+        for (batch_index, batch) in scene.batches().enumerate() {
             let batch_name = match &batch {
                 PrimitiveBatch::Shadows(_) => "shadows",
                 PrimitiveBatch::Quads(_) => "quads",
@@ -1906,42 +1930,44 @@ impl MetalRenderer {
                     viewport,
                     command_encoder,
                 ),
-                PrimitiveBatch::Paths(paths) => {
+                PrimitiveBatch::Paths(_) => {
                     // Пакет вне цели рендера ничего не рисует: основной проход не прерывается.
-                    let Some(region) = self.path_batch_region(paths, viewport) else {
+                    let Some(planned) = path_plan.batches.get(&batch_index) else {
                         continue;
                     };
-                    command_encoder.end_encoding();
+                    let mut did_draw = true;
+                    if planned.pass >= rasterized_path_passes {
+                        command_encoder.end_encoding();
+                        did_draw = self.draw_paths_to_intermediate(
+                            &path_plan.passes[planned.pass],
+                            instance_buffer,
+                            instance_offset,
+                            viewport,
+                            command_buffer,
+                            path_intermediate.as_ref(),
+                            path_intermediate_msaa.as_ref(),
+                        );
+                        rasterized_path_passes = planned.pass + 1;
+                        command_encoder = new_command_encoder(
+                            command_buffer,
+                            target,
+                            viewport,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                    }
 
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        region,
-                        instance_buffer,
-                        instance_offset,
-                        viewport,
-                        command_buffer,
-                        path_intermediate.as_ref(),
-                        path_intermediate_msaa.as_ref(),
-                    );
-
-                    command_encoder =
-                        new_command_encoder(command_buffer, target, viewport, |color_attachment| {
-                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        });
-
-                    if did_draw {
-                        self.draw_paths_from_intermediate(
-                            paths,
-                            region,
+                    did_draw
+                        && self.draw_paths_from_intermediate(
+                            &planned.sprites,
+                            path_plan.passes[planned.pass].area,
                             instance_buffer,
                             instance_offset,
                             viewport,
                             command_encoder,
                             path_intermediate.as_ref(),
                         )
-                    } else {
-                        false
-                    }
                 }
                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
                     underlines,
@@ -2426,6 +2452,65 @@ impl MetalRenderer {
         }
     }
 
+    /// Раскладывает пакеты путей сцены по проходам растеризации в промежуточную текстуру.
+    ///
+    /// Пакет присоединяется к текущему проходу, если ячейки, которых касаются его треугольники,
+    /// не заняты пакетами прохода, а рамка прохода растёт не больше площади пакета. Тогда
+    /// пакеты не мешают друг другу в общей текстуре, а проход не дороже отдельных. Пакет с
+    /// прежним копированием (без ячеек) занимает проход один.
+    fn plan_path_passes<'a>(&self, scene: &'a Scene, viewport: Viewport) -> PathPassPlan<'a> {
+        let mut plan = PathPassPlan::default();
+        if !scene_needs_path_intermediate(scene) {
+            return plan;
+        }
+        let grid_columns = (viewport.size.width.0.max(0) as u32).div_ceil(PATH_COPY_CELL) as usize;
+        let grid_rows = (viewport.size.height.0.max(0) as u32).div_ceil(PATH_COPY_CELL) as usize;
+        let mut occupancy = vec![false; grid_columns * grid_rows];
+        let mut shareable_pass = false;
+        for (batch_index, batch) in scene.batches().enumerate() {
+            let PrimitiveBatch::Paths(paths) = batch else {
+                continue;
+            };
+            let Some(region) = self.path_batch_region(paths, viewport) else {
+                continue;
+            };
+            let clips = path_copy_clips(paths);
+            let cells = TouchedCells::of_paths(region, paths, viewport);
+            let cell_sprites = self.path_copy_sprites(&cells, region, &clips, viewport);
+            let shareable = cell_sprites.is_some();
+            let current = plan.passes.last_mut().filter(|pass| {
+                if !(shareable_pass && shareable) {
+                    return false;
+                }
+                let merged = pass.area.union(region);
+                merged.area() <= pass.area.area() + region.area()
+                    && !cells.overlaps(&occupancy, grid_columns)
+            });
+            if let Some(pass) = current {
+                pass.area = pass.area.union(region);
+                pass.paths.push(paths);
+            } else {
+                plan.passes.push(PathPass {
+                    area: region,
+                    paths: vec![paths],
+                });
+                occupancy.fill(false);
+            }
+            if shareable {
+                cells.occupy(&mut occupancy, grid_columns);
+            }
+            shareable_pass = shareable;
+            plan.batches.insert(
+                batch_index,
+                PlannedPathBatch {
+                    pass: plan.passes.len() - 1,
+                    sprites: cell_sprites.unwrap_or(clips),
+                },
+            );
+        }
+        plan
+    }
+
     /// Область цели рендера, которой касается пакет путей; `None`, если пакет её не касается.
     fn path_batch_region(
         &self,
@@ -2441,23 +2526,23 @@ impl MetalRenderer {
 
     fn path_copy_sprites(
         &self,
-        paths: &[Path<ScaledPixels>],
-        clips: &[PathSprite],
+        cells: &TouchedCells,
         region: PathBatchRegion,
+        clips: &[PathSprite],
         viewport: Viewport,
     ) -> Option<Vec<PathSprite>> {
         #[cfg(test)]
         if self.reference_path_passes {
             return None;
         }
-        region.copy_sprites(paths, clips, viewport)
+        cells.copy_sprites(region, clips, viewport)
     }
 
+    /// Растеризует пути прохода в его область промежуточной текстуры.
     #[allow(clippy::too_many_arguments)]
     fn draw_paths_to_intermediate(
         &self,
-        paths: &[Path<ScaledPixels>],
-        region: PathBatchRegion,
+        pass: &PathPass,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport: Viewport,
@@ -2465,15 +2550,13 @@ impl MetalRenderer {
         intermediate_texture: Option<&metal::Texture>,
         intermediate_msaa_texture: Option<&metal::Texture>,
     ) -> bool {
-        if paths.is_empty() {
-            return true;
-        }
         let Some(intermediate_texture) = intermediate_texture else {
             return false;
         };
+        let region = pass.area;
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
-        // Проход очищает, растеризует и сводит MSAA только в области пакета: она лежит в левом
+        // Проход очищает, растеризует и сводит MSAA только в своей области: она лежит в левом
         // верхнем углу промежуточной текстуры, а не на своём месте во всём кадре.
         render_pass_descriptor.set_render_target_width(region.width as u64);
         render_pass_descriptor.set_render_target_height(region.height as u64);
@@ -2515,7 +2598,7 @@ impl MetalRenderer {
         };
         let intermediate_origin = region.origin();
 
-        for path in paths {
+        for path in pass.paths.iter().flat_map(|paths| paths.iter()) {
             align_offset(instance_offset);
             let vertices = path
                 .vertices
@@ -2704,21 +2787,18 @@ impl MetalRenderer {
         true
     }
 
+    /// Наносит пакет путей на кадр прямоугольниками `sprites` из области прохода `area`.
     #[allow(clippy::too_many_arguments)]
     fn draw_paths_from_intermediate(
         &self,
-        paths: &[Path<ScaledPixels>],
-        region: PathBatchRegion,
+        sprites: &[PathSprite],
+        area: PathBatchRegion,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport: Viewport,
         command_encoder: &metal::RenderCommandEncoderRef,
         intermediate_texture: Option<&metal::Texture>,
     ) -> bool {
-        let Some(first_path) = paths.first() else {
-            return true;
-        };
-
         let Some(intermediate_texture) = intermediate_texture else {
             return false;
         };
@@ -2735,7 +2815,7 @@ impl MetalRenderer {
             &viewport as *const Viewport as *const _,
         );
 
-        let intermediate_origin = region.origin();
+        let intermediate_origin = area.origin();
         command_encoder.set_vertex_bytes(
             SpriteInputIndex::IntermediateOrigin as u64,
             mem::size_of_val(&intermediate_origin) as u64,
@@ -2747,38 +2827,8 @@ impl MetalRenderer {
             Some(intermediate_texture),
         );
 
-        // When copying paths from the intermediate texture to the drawable,
-        // each pixel must only be copied once, in case of transparent paths.
-        //
-        // If all paths have the same draw order, then their bounds are all
-        // disjoint, so we can copy each path's bounds individually. If this
-        // batch combines different draw orders, we perform a single copy
-        // for a minimal spanning rect.
-        //
-        // Затем эти прямоугольники обрезаются ячейками, которых касаются треугольники путей:
-        // пустые места промежуточной текстуры не копируются.
-        let clips: Vec<PathSprite>;
-        if paths.last().unwrap().order == first_path.order {
-            clips = paths
-                .iter()
-                .map(|path| PathSprite {
-                    bounds: path.clipped_bounds(),
-                })
-                .collect();
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            clips = vec![PathSprite { bounds }];
-        }
-        let sprites = match self.path_copy_sprites(paths, &clips, region, viewport) {
-            Some(cells) => cells,
-            None => clips,
-        };
-
         align_offset(instance_offset);
-        let sprite_bytes_len = mem::size_of_val(sprites.as_slice());
+        let sprite_bytes_len = mem::size_of_val(sprites);
         let next_offset = *instance_offset + sprite_bytes_len;
         if next_offset > instance_buffer.size {
             return false;
@@ -3818,25 +3868,111 @@ impl PathBatchRegion {
         })
     }
 
-    /// Прямоугольники копирования пакета из промежуточной текстуры: прежние прямоугольники
-    /// `clips`, обрезанные ячейками сетки, которых касаются треугольники путей. Пиксель с
-    /// покрытием лежит в рамке своего треугольника и в обрезанных границах пути, рамка
-    /// расширена на пиксель. Вне таких ячеек промежуточная текстура прозрачна, и копирование
-    /// её не меняло кадр. `None`, если прямоугольников больше [`MAX_PATH_COPY_SPRITES`].
-    fn copy_sprites(
-        &self,
-        paths: &[Path<ScaledPixels>],
-        clips: &[PathSprite],
-        viewport: Viewport,
-    ) -> Option<Vec<PathSprite>> {
-        let columns = self.width.div_ceil(PATH_COPY_CELL) as usize;
-        let rows = self.height.div_ceil(PATH_COPY_CELL) as usize;
+    /// Охватывающий прямоугольник двух областей.
+    fn union(&self, other: Self) -> Self {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        Self {
+            x,
+            y,
+            width: (self.x + self.width).max(other.x + other.width) - x,
+            height: (self.y + self.height).max(other.y + other.height) - y,
+        }
+    }
+
+    fn area(&self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+
+    #[cfg(test)]
+    fn full_frame(viewport: Viewport) -> Option<Self> {
+        let width = viewport.size.width.0.max(0) as u32;
+        let height = viewport.size.height.0.max(0) as u32;
+        (width > 0 && height > 0).then_some(Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
+    }
+
+    fn origin(&self) -> [f32; 2] {
+        [self.x as f32, self.y as f32]
+    }
+}
+
+/// Проходы растеризации путей кадра и то, что каждый пакет путей наносит на кадр.
+#[derive(Default)]
+struct PathPassPlan<'a> {
+    passes: Vec<PathPass<'a>>,
+    /// Пакеты путей по номеру в `Scene::batches`; пакетов вне цели рендера здесь нет.
+    batches: std::collections::HashMap<usize, PlannedPathBatch>,
+}
+
+/// Проход растеризации в промежуточную текстуру: его область и пути его пакетов.
+struct PathPass<'a> {
+    area: PathBatchRegion,
+    paths: Vec<&'a [Path<ScaledPixels>]>,
+}
+
+struct PlannedPathBatch {
+    pass: usize,
+    sprites: Vec<PathSprite>,
+}
+
+/// Прежние прямоугольники копирования пакета: каждый пиксель копируется один раз.
+///
+/// If all paths have the same draw order, then their bounds are all
+/// disjoint, so we can copy each path's bounds individually. If this
+/// batch combines different draw orders, we perform a single copy
+/// for a minimal spanning rect.
+fn path_copy_clips(paths: &[Path<ScaledPixels>]) -> Vec<PathSprite> {
+    let (Some(first), Some(last)) = (paths.first(), paths.last()) else {
+        return Vec::new();
+    };
+    if first.order == last.order {
+        return paths
+            .iter()
+            .map(|path| PathSprite {
+                bounds: path.clipped_bounds(),
+            })
+            .collect();
+    }
+    let mut bounds = first.clipped_bounds();
+    for path in &paths[1..] {
+        bounds = bounds.union(&path.clipped_bounds());
+    }
+    vec![PathSprite { bounds }]
+}
+
+/// Ячейки сетки цели рендера со стороной [`PATH_COPY_CELL`], которых касаются треугольники
+/// пакета путей: пиксель с покрытием лежит в рамке своего треугольника и в обрезанных
+/// границах пути, рамка расширена на пиксель. Вне этих ячеек промежуточная текстура пакета
+/// прозрачна. Сетка общая для всех пакетов кадра.
+struct TouchedCells {
+    column: usize,
+    row: usize,
+    columns: usize,
+    rows: usize,
+    touched: Vec<bool>,
+}
+
+impl TouchedCells {
+    fn of_paths(region: PathBatchRegion, paths: &[Path<ScaledPixels>], viewport: Viewport) -> Self {
+        let column = (region.x / PATH_COPY_CELL) as usize;
+        let row = (region.y / PATH_COPY_CELL) as usize;
+        let columns = (region.x + region.width).div_ceil(PATH_COPY_CELL) as usize - column;
+        let rows = (region.y + region.height).div_ceil(PATH_COPY_CELL) as usize - row;
         // Разностная сетка: прямоугольник ячеек отмечается за O(1), затем префиксные суммы.
         let stride = columns + 1;
         let mut marks = vec![0i32; stride * (rows + 1)];
         let origin = [viewport.origin.x.0, viewport.origin.y.0];
-        let region_min = [self.x as f32, self.y as f32];
-        let region_max = [(self.x + self.width) as f32, (self.y + self.height) as f32];
+        let first_cell = [column, row];
+        let region_min = [region.x as f32, region.y as f32];
+        let region_max = [
+            (region.x + region.width) as f32,
+            (region.y + region.height) as f32,
+        ];
         for path in paths {
             let clip = path.clipped_bounds();
             let clip_min = [clip.origin.x.0 - origin[0], clip.origin.y.0 - origin[1]];
@@ -3869,15 +4005,13 @@ impl PathBatchRegion {
                 for axis in 0..2 {
                     let low = (min[axis].max(clip_min[axis]).floor() - 1.0).max(region_min[axis]);
                     let high = (max[axis].min(clip_max[axis]).ceil() + 1.0).min(region_max[axis]);
-                    if !(high > low) {
+                    if high.partial_cmp(&low) != Some(std::cmp::Ordering::Greater) {
                         empty = true;
                         break;
                     }
-                    let low = (low - region_min[axis]) as u32;
-                    let high = (high - region_min[axis]) as u32;
                     cells[axis] = [
-                        (low / PATH_COPY_CELL) as usize,
-                        high.div_ceil(PATH_COPY_CELL) as usize,
+                        (low as u32 / PATH_COPY_CELL) as usize - first_cell[axis],
+                        (high as u32).div_ceil(PATH_COPY_CELL) as usize - first_cell[axis],
                     ];
                 }
                 if empty {
@@ -3900,50 +4034,82 @@ impl PathBatchRegion {
                 marks[row * stride + column] += marks[(row - 1) * stride + column];
             }
         }
+        let mut touched = Vec::with_capacity(columns * rows);
+        for row in 0..rows {
+            touched.extend(
+                marks[row * stride..row * stride + columns]
+                    .iter()
+                    .map(|&m| m > 0),
+            );
+        }
+        Self {
+            column,
+            row,
+            columns,
+            rows,
+            touched,
+        }
+    }
 
-        let mut sprites = Vec::new();
-        let region_rect = |column: usize, row: usize, end: usize| {
-            let edge = |cell: usize, extent: u32| (cell as u32 * PATH_COPY_CELL).min(extent);
-            let x0 = edge(column, self.width);
-            let y0 = edge(row, self.height);
-            Bounds::new(
-                point(
-                    viewport.origin.x + ScaledPixels((self.x + x0) as f32),
-                    viewport.origin.y + ScaledPixels((self.y + y0) as f32),
-                ),
-                size(
-                    ScaledPixels((edge(end, self.width) - x0) as f32),
-                    ScaledPixels((edge(row + 1, self.height) - y0) as f32),
-                ),
-            )
-        };
-        let cell_range = |low: f32, high: f32, extent: u32, cells: usize| {
-            let low = low.max(0.0);
-            let high = high.min(extent as f32);
-            if !(high > low) {
+    fn is_touched(&self, column: usize, row: usize) -> bool {
+        self.touched[row * self.columns + column]
+    }
+
+    /// Прямоугольники копирования пакета: прежние `clips`, обрезанные затронутыми ячейками.
+    /// `None`, если прямоугольников больше [`MAX_PATH_COPY_SPRITES`].
+    fn copy_sprites(
+        &self,
+        region: PathBatchRegion,
+        clips: &[PathSprite],
+        viewport: Viewport,
+    ) -> Option<Vec<PathSprite>> {
+        let origin = [viewport.origin.x.0, viewport.origin.y.0];
+        // Ячейки (относительно первой ячейки пакета), которые пересекает отрезок [low, high).
+        let cell_range = |low: f32, high: f32, start: u32, extent: u32, first: usize| {
+            let low = low.max(start as f32);
+            let high = high.min((start + extent) as f32);
+            if high.partial_cmp(&low) != Some(std::cmp::Ordering::Greater) {
                 return 0..0;
             }
-            let first = (low as u32 / PATH_COPY_CELL) as usize;
-            let last = (high.ceil() as u32).div_ceil(PATH_COPY_CELL) as usize;
-            first..last.min(cells)
+            (low as u32 / PATH_COPY_CELL) as usize - first
+                ..(high.ceil() as u32).div_ceil(PATH_COPY_CELL) as usize - first
         };
+        let mut sprites = Vec::new();
         for clip in clips {
             let clip = clip.bounds;
-            let x = clip.origin.x.0 - origin[0] - region_min[0];
-            let y = clip.origin.y.0 - origin[1] - region_min[1];
-            let column_range = cell_range(x, x + clip.size.width.0, self.width, columns);
-            for row in cell_range(y, y + clip.size.height.0, self.height, rows) {
-                let mut column = column_range.start;
-                while column < column_range.end {
-                    if marks[row * stride + column] <= 0 {
+            let x = clip.origin.x.0 - origin[0];
+            let y = clip.origin.y.0 - origin[1];
+            let columns = cell_range(
+                x,
+                x + clip.size.width.0,
+                region.x,
+                region.width,
+                self.column,
+            );
+            let rows = cell_range(y, y + clip.size.height.0, region.y, region.height, self.row);
+            for row in rows {
+                let mut column = columns.start;
+                while column < columns.end {
+                    if !self.is_touched(column, row) {
                         column += 1;
                         continue;
                     }
                     let run_start = column;
-                    while column < column_range.end && marks[row * stride + column] > 0 {
+                    while column < columns.end && self.is_touched(column, row) {
                         column += 1;
                     }
-                    let bounds = region_rect(run_start, row, column).intersect(&clip);
+                    let cell = PATH_COPY_CELL as f32;
+                    let run = Bounds::new(
+                        point(
+                            ScaledPixels(origin[0] + (self.column + run_start) as f32 * cell),
+                            ScaledPixels(origin[1] + (self.row + row) as f32 * cell),
+                        ),
+                        size(
+                            ScaledPixels((column - run_start) as f32 * cell),
+                            ScaledPixels(cell),
+                        ),
+                    );
+                    let bounds = run.intersect(&clip);
                     if bounds.is_empty() {
                         continue;
                     }
@@ -3957,20 +4123,23 @@ impl PathBatchRegion {
         Some(sprites)
     }
 
-    #[cfg(test)]
-    fn full_frame(viewport: Viewport) -> Option<Self> {
-        let width = viewport.size.width.0.max(0) as u32;
-        let height = viewport.size.height.0.max(0) as u32;
-        (width > 0 && height > 0).then_some(Self {
-            x: 0,
-            y: 0,
-            width,
-            height,
+    fn cells(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        (0..self.rows).flat_map(move |row| {
+            (0..self.columns)
+                .filter(move |&column| self.is_touched(column, row))
+                .map(move |column| (self.column + column, self.row + row))
         })
     }
 
-    fn origin(&self) -> [f32; 2] {
-        [self.x as f32, self.y as f32]
+    fn overlaps(&self, occupancy: &[bool], grid_columns: usize) -> bool {
+        self.cells()
+            .any(|(column, row)| occupancy[row * grid_columns + column])
+    }
+
+    fn occupy(&self, occupancy: &mut [bool], grid_columns: usize) {
+        for (column, row) in self.cells() {
+            occupancy[row * grid_columns + column] = true;
+        }
     }
 }
 
@@ -4305,24 +4474,21 @@ mod path_region_tests {
             .to_vec()
     }
 
-    /// Пакеты путей, разделённые квадом, с градиентом и выходом за край цели.
-    fn scene_with_path_batches() -> Scene {
-        let mut scene = Scene::default();
-        scene.insert_primitive(curved_path(
-            (12.5, 8.25),
-            50.,
-            linear_gradient(
-                45.,
-                linear_color_stop(hsla(0.6, 0.9, 0.5, 1.), 0.),
-                linear_color_stop(hsla(0.1, 0.9, 0.6, 0.7), 1.),
-            ),
-        ));
-        scene.insert_primitive(Quad {
+    fn gradient() -> Background {
+        linear_gradient(
+            45.,
+            linear_color_stop(hsla(0.6, 0.9, 0.5, 1.), 0.),
+            linear_color_stop(hsla(0.1, 0.9, 0.6, 0.7), 1.),
+        )
+    }
+
+    fn translucent_quad(x: f32, y: f32, width: f32, height: f32) -> Quad {
+        Quad {
             order: 0,
             border_style: Default::default(),
             bounds: Bounds::new(
-                point(ScaledPixels(30.), ScaledPixels(30.)),
-                size(ScaledPixels(70.), ScaledPixels(50.)),
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(width), ScaledPixels(height)),
             ),
             content_mask: mask(),
             background: hsla(0.3, 0.5, 0.5, 0.6).into(),
@@ -4330,7 +4496,14 @@ mod path_region_tests {
             corner_radii: Corners::default(),
             border_widths: Edges::default(),
             transformation: TransformationMatrix::unit(),
-        });
+        }
+    }
+
+    /// Пакеты путей, разделённые квадом, чьи пути касаются общих ячеек: проходы раздельные.
+    fn scene_with_crossing_batches() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(curved_path((12.5, 8.25), 50., gradient()));
+        scene.insert_primitive(translucent_quad(30., 30., 70., 50.));
         scene.insert_primitive(curved_path(
             (60.75, 50.5),
             40.,
@@ -4342,6 +4515,22 @@ mod path_region_tests {
             hsla(0.5, 0.8, 0.4, 1.).into(),
         ));
         scene.insert_primitive(diagonal_stroke(hsla(0.15, 0.9, 0.5, 0.9).into()));
+        scene.finish();
+        scene
+    }
+
+    /// Пакеты путей, разделённые квадом, в непересекающихся ячейках: проход общий. Второй
+    /// пакет с градиентом и выходом за край цели.
+    fn scene_with_shared_pass() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(diagonal_stroke(hsla(0.15, 0.9, 0.5, 0.9).into()));
+        scene.insert_primitive(translucent_quad(100., 80., 50., 30.));
+        scene.insert_primitive(curved_path((12.5, 8.25), 40., gradient()));
+        scene.insert_primitive(curved_path(
+            (130.3, 95.6),
+            45.,
+            hsla(0.5, 0.8, 0.4, 1.).into(),
+        ));
         scene.finish();
         scene
     }
@@ -4405,8 +4594,8 @@ mod path_region_tests {
         let clips = [PathSprite {
             bounds: path.clipped_bounds(),
         }];
-        let sprites = region
-            .copy_sprites(std::slice::from_ref(&path), &clips, viewport)
+        let sprites = TouchedCells::of_paths(region, std::slice::from_ref(&path), viewport)
+            .copy_sprites(region, &clips, viewport)
             .expect("few cells");
         let area: f32 = sprites
             .iter()
@@ -4463,47 +4652,56 @@ mod path_region_tests {
             bounds: path.clipped_bounds(),
         }];
         assert!(
-            region
-                .copy_sprites(std::slice::from_ref(&path), &clips, viewport)
+            TouchedCells::of_paths(region, std::slice::from_ref(&path), viewport)
+                .copy_sprites(region, &clips, viewport)
                 .is_none()
         );
     }
 
     #[test]
-    fn path_batch_region_renders_like_full_frame_pass() {
+    fn path_passes_render_like_full_frame_pass_per_batch() {
         if metal::Device::system_default().is_none() {
             return;
         }
-        let scene = scene_with_path_batches();
-        let path_batches = scene
-            .batches()
-            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(_)))
-            .count();
-        assert!(path_batches >= 2, "scene has {path_batches} path batches");
-
         let pool = Arc::new(Mutex::new(InstanceBufferPool {
             buffer_size: 4 * 1024 * 1024,
             buffers: Vec::new(),
         }));
         let mut renderer = MetalRenderer::new(pool);
-        renderer.reference_path_passes = true;
-        let reference = render(&mut renderer, &scene);
-        renderer.reference_path_passes = false;
-        let candidate = render(&mut renderer, &scene);
+        for (name, scene, expected_passes) in [
+            ("crossing", scene_with_crossing_batches(), 2),
+            ("shared", scene_with_shared_pass(), 1),
+        ] {
+            let path_batches = scene
+                .batches()
+                .filter(|batch| matches!(batch, PrimitiveBatch::Paths(_)))
+                .count();
+            assert_eq!(path_batches, 2, "{name}: path batches");
+            let passes = renderer.plan_path_passes(&scene, viewport()).passes.len();
+            assert_eq!(passes, expected_passes, "{name}: path passes");
 
-        let painted = reference
-            .chunks_exact(4)
-            .filter(|pixel| pixel[..3] != [0, 0, 0])
-            .count();
-        assert!(painted > 1000, "paths painted only {painted} pixels");
-        let differing = reference
-            .iter()
-            .zip(&candidate)
-            .filter(|(reference, candidate)| reference != candidate)
-            .count();
-        assert_eq!(
-            differing, 0,
-            "{differing} channels differ from the full-frame pass"
-        );
+            renderer.reference_path_passes = true;
+            let reference = render(&mut renderer, &scene);
+            renderer.reference_path_passes = false;
+            let candidate = render(&mut renderer, &scene);
+
+            let painted = reference
+                .chunks_exact(4)
+                .filter(|pixel| pixel[..3] != [0, 0, 0])
+                .count();
+            assert!(
+                painted > 1000,
+                "{name}: paths painted only {painted} pixels"
+            );
+            let differing = reference
+                .iter()
+                .zip(&candidate)
+                .filter(|(reference, candidate)| reference != candidate)
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{name}: {differing} channels differ from full-frame passes per batch"
+            );
+        }
     }
 }
