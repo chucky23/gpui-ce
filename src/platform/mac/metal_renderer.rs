@@ -1,3 +1,4 @@
+use super::drawable_prefetch::{DrawablePrefetcher, DrawableTake, async_drawable_enabled};
 use super::metal_atlas::MetalAtlas;
 use crate::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, FramePresentationSample,
@@ -643,10 +644,22 @@ impl InstanceBufferPool {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrawableMiss {
+    Unavailable,
+    NotReady,
+}
+
 pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: metal::MetalLayer,
     presents_with_transaction: bool,
+    /// Заранее взятые drawable основного слоя (`GPUI_ASYNC_DRAWABLE=1`). `None` — прежний
+    /// режим: `nextDrawable` блокирует главный поток.
+    drawable_prefetcher: Option<DrawablePrefetcher<metal::MetalDrawable>>,
+    /// Показ отложен, потому что drawable не был готов. Сцена остаётся в окне, показ
+    /// повторяет такт DisplayLink или сигнал готовности.
+    deferred_presentation: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -931,6 +944,8 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            drawable_prefetcher: None,
+            deferred_presentation: false,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -1131,6 +1146,29 @@ impl MetalRenderer {
             self.root_presentation_queue.in_flight(),
             self.layer.maximum_drawable_count(),
         )
+    }
+
+    /// Включает заблаговременное получение drawable, если задано `GPUI_ASYNC_DRAWABLE=1`.
+    /// `notify_ready` вызывается из вспомогательного потока, когда отложенный показ можно
+    /// повторить, и должен запросить кадр на главном потоке.
+    pub fn start_drawable_prefetch(&mut self, notify_ready: impl Fn() + Send + 'static) {
+        if !async_drawable_enabled() || self.drawable_prefetcher.is_some() {
+            return;
+        }
+        let layer = self.layer.clone();
+        match DrawablePrefetcher::spawn(
+            "gpui-drawable-prefetch",
+            move || objc::rc::autoreleasepool(|| layer.next_drawable().map(ToOwned::to_owned)),
+            notify_ready,
+        ) {
+            Ok(prefetcher) => self.drawable_prefetcher = Some(prefetcher),
+            Err(error) => log::error!("failed to start drawable prefetch thread: {error}"),
+        }
+    }
+
+    /// Показ был отложен из-за неготового drawable и ещё не повторён. Сбрасывает признак.
+    pub fn take_deferred_presentation(&mut self) -> bool {
+        mem::take(&mut self.deferred_presentation)
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -1356,25 +1394,57 @@ impl MetalRenderer {
             event.timestamp_ns = next_drawable_started_ns.unwrap_or_default();
             crate::frame_trace::record(event);
         }
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
-            #[cfg(feature = "frame-trace")]
-            if let Some(started_ns) = next_drawable_started_ns {
-                self.record_frame_submission_skipped(
-                    scene,
-                    crate::frame_trace::FrameSubmissionSkipReason::NextDrawableUnavailable,
-                    crate::frame_trace::monotonic_time_ns().saturating_sub(started_ns),
-                );
-            }
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            let deferred = mem::take(&mut self.raster_compositor_deferred_renders);
-            self.commit_deferred_renders(deferred);
-            return;
+        let drawable_matches_viewport = |drawable: &metal::MetalDrawable| {
+            let texture = drawable.texture();
+            texture.width() == viewport_size.width.0 as u64
+                && texture.height() == viewport_size.height.0 as u64
         };
+        let acquired_drawable = match &self.drawable_prefetcher {
+            None => layer
+                .next_drawable()
+                .map(ToOwned::to_owned)
+                .ok_or(DrawableMiss::Unavailable),
+            // Синхронный кадр (resize, becomeKey) нельзя отложить: он ждёт, как прежде.
+            Some(prefetcher) if self.presents_with_transaction => prefetcher
+                .take_blocking(drawable_matches_viewport)
+                .ok_or(DrawableMiss::Unavailable),
+            Some(prefetcher) => match prefetcher.try_take(drawable_matches_viewport) {
+                DrawableTake::Ready(drawable) => Ok(drawable),
+                DrawableTake::NotReady => Err(DrawableMiss::NotReady),
+                DrawableTake::Unavailable => Err(DrawableMiss::Unavailable),
+            },
+        };
+        let acquired_drawable = match acquired_drawable {
+            Ok(drawable) => drawable,
+            Err(miss) => {
+                #[cfg(feature = "frame-trace")]
+                if let Some(started_ns) = next_drawable_started_ns {
+                    self.record_frame_submission_skipped(
+                        scene,
+                        match miss {
+                            DrawableMiss::Unavailable => {
+                                crate::frame_trace::FrameSubmissionSkipReason::NextDrawableUnavailable
+                            }
+                            DrawableMiss::NotReady => {
+                                crate::frame_trace::FrameSubmissionSkipReason::DrawableNotReady
+                            }
+                        },
+                        crate::frame_trace::monotonic_time_ns().saturating_sub(started_ns),
+                    );
+                }
+                match miss {
+                    DrawableMiss::Unavailable => log::error!(
+                        "failed to retrieve next drawable, drawable size: {:?}",
+                        viewport_size
+                    ),
+                    DrawableMiss::NotReady => self.deferred_presentation = true,
+                }
+                let deferred = mem::take(&mut self.raster_compositor_deferred_renders);
+                self.commit_deferred_renders(deferred);
+                return;
+            }
+        };
+        let drawable: &metal::MetalDrawableRef = &acquired_drawable;
         #[cfg(feature = "frame-trace")]
         let trace_next_drawable_wait_ns = next_drawable_started_ns
             .map(|next_drawable_started_ns| {
@@ -3899,6 +3969,10 @@ mod raster_comparison_tests {
         assert_eq!(
             crate::frame_trace::FrameSubmissionSkipReason::DiagnosticHold as u64,
             4
+        );
+        assert_eq!(
+            crate::frame_trace::FrameSubmissionSkipReason::DrawableNotReady as u64,
+            5
         );
     }
 }

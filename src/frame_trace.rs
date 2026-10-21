@@ -164,6 +164,9 @@ pub enum FrameSubmissionSkipReason {
     EncodeRetryExhausted = 3,
     /// Calibration intentionally deferred this attempt.
     DiagnosticHold = 4,
+    /// Заблаговременно запрошенный drawable ещё не готов (`GPUI_ASYNC_DRAWABLE=1`). Главный
+    /// поток не ждёт: показ повторяется по сигналу готовности или на следующем такте.
+    DrawableNotReady = 5,
 }
 
 /// Amount of diagnostic detail retained by a bounded frame trace.
