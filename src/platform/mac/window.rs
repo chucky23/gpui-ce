@@ -427,6 +427,10 @@ struct MacWindowState {
     /// отложенного из-за неготового drawable, относится к этому же такту.
     #[cfg(feature = "frame-trace")]
     last_requested_trace_display_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
+    /// Такт пропущен без построения кадра: drawable корневого слоя не был готов. Кадр строит
+    /// `step` по сигналу готовности.
+    #[cfg(not(feature = "macos-blade"))]
+    frame_waits_for_drawable: bool,
 }
 
 impl MacWindowState {
@@ -735,6 +739,8 @@ impl MacWindow {
                 activated_least_once: false,
                 #[cfg(feature = "frame-trace")]
                 last_requested_trace_display_tick: None,
+                #[cfg(not(feature = "macos-blade"))]
+                frame_waits_for_drawable: false,
             })));
 
             (*native_window).set_ivar(
@@ -2387,6 +2393,26 @@ unsafe extern "C" fn step(view: *mut c_void) {
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
 
+    // При `GPUI_ASYNC_DRAWABLE=1` такт без готового drawable не строит кадр: собранная сейчас
+    // сцена ушла бы в пропуск, а к сигналу готовности её вытеснил бы новый ввод. Кадр строит
+    // `step` по сигналу, уже с вводом, пришедшим за время ожидания. Признаки повторного показа
+    // остаются до этого кадра, а он нацелен на последний такт.
+    #[cfg(not(feature = "macos-blade"))]
+    if !lock.renderer.root_drawable_ready_for_frame() {
+        lock.frame_waits_for_drawable = true;
+        #[cfg(feature = "frame-trace")]
+        if trace_display_tick.is_some() {
+            lock.last_requested_trace_display_tick = trace_display_tick;
+        }
+        return;
+    }
+    #[cfg(not(feature = "macos-blade"))]
+    #[cfg_attr(not(feature = "frame-trace"), allow(unused_variables))]
+    let waited_for_drawable = mem::take(&mut lock.frame_waits_for_drawable);
+    #[cfg(feature = "macos-blade")]
+    #[allow(unused_variables)]
+    let waited_for_drawable = false;
+
     // Metal отбросил drawable последнего кадра, а новее ничего не отправлено: без повторного
     // показа на экране останется предыдущий кадр до следующего изменения сцены. Отложенный из-за
     // неготового drawable показ повторяется так же. Оба признака сбрасываются.
@@ -2400,11 +2426,11 @@ unsafe extern "C" fn step(view: *mut c_void) {
     #[cfg(feature = "macos-blade")]
     let require_presentation = false;
 
-    // Сигнал готовности drawable приходит между тактами. Повтор показа без нового такта
+    // Сигнал готовности drawable приходит между тактами. Кадр по сигналу без нового такта
     // нацелен на тот же такт, что и отложенная попытка, как и блокирующий `nextDrawable`.
     #[cfg(feature = "frame-trace")]
     {
-        if deferred_presentation && trace_display_tick.is_none() {
+        if (deferred_presentation || waited_for_drawable) && trace_display_tick.is_none() {
             trace_display_tick = lock.last_requested_trace_display_tick;
         }
         lock.last_requested_trace_display_tick = trace_display_tick;

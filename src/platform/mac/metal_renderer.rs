@@ -1186,6 +1186,26 @@ impl MetalRenderer {
         }
     }
 
+    /// Можно ли строить кадр на этом такте. В режиме `GPUI_ASYNC_DRAWABLE=1` без готового
+    /// drawable корневого слоя ответ «нет»: кадр, собранный сейчас, ушёл бы в пропуск и был бы
+    /// вытеснен. Тогда drawable запрашивается, и сигнал готовности запросит кадр снова. В прежнем
+    /// режиме и для синхронных кадров ответ всегда «да».
+    pub fn root_drawable_ready_for_frame(&self) -> bool {
+        let Some(prefetcher) = &self.drawable_prefetcher else {
+            return true;
+        };
+        if self.presents_with_transaction {
+            return true;
+        }
+        let viewport_size = self.layer.drawable_size();
+        let width = viewport_size.width.ceil() as u64;
+        let height = viewport_size.height.ceil() as u64;
+        prefetcher.poll_ready(|drawable: &metal::MetalDrawable| {
+            let texture = drawable.texture();
+            texture.width() == width && texture.height() == height
+        })
+    }
+
     /// Показ был отложен из-за неготового drawable и ещё не повторён. Сбрасывает признак.
     pub fn take_deferred_presentation(&mut self) -> bool {
         mem::take(&mut self.deferred_presentation)
