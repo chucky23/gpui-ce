@@ -24,6 +24,7 @@ mod executor;
 pub mod frame_trace;
 mod geometry;
 mod global;
+mod idle_wake;
 mod input;
 mod inspector;
 mod interactive;

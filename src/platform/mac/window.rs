@@ -58,6 +58,7 @@ static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
+static mut IDLE_WAKE_TARGET_CLASS: *const Class = ptr::null();
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
@@ -270,8 +271,118 @@ unsafe fn build_classes() {
                 decl.register()
             }
         };
+        IDLE_WAKE_TARGET_CLASS = {
+            let mut decl = ClassDecl::new("GPUIIdleWakeTarget", class!(NSObject)).unwrap();
+            unsafe {
+                decl.add_method(
+                    sel!(idleWakeTick:),
+                    idle_wake_tick as extern "C" fn(&Object, Sel, id),
+                );
+            }
+            decl.register()
+        };
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CAFrameRateRange {
+    minimum: f32,
+    maximum: f32,
+    preferred: f32,
+}
+
+#[link(name = "Foundation", kind = "framework")]
+unsafe extern "C" {
+    static NSRunLoopCommonModes: id;
+}
+
+/// `GPUI_IDLE_WAKE=link`: `NSView.displayLink` (macOS 14+) с `preferredFrameRateRange` 120 Гц.
+///
+/// Кадры по-прежнему задаёт CVDisplayLink, о котором WindowServer не знает. Этот DisplayLink
+/// ничего не рисует: пока он не на паузе, система видит запрос высокой частоты и, по замыслу
+/// опыта, не опускает частоту дисплея в покое после ввода.
+struct IdleWakeLink {
+    link: id,
+    paused: bool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl IdleWakeLink {
+    unsafe fn new(native_view: id) -> Option<Self> {
+        unsafe {
+            let supported: BOOL =
+                msg_send![native_view, respondsToSelector: sel!(displayLinkWithTarget:selector:)];
+            if supported != YES {
+                log::warn!("idle wake: NSView.displayLink requires macOS 14");
+                return None;
+            }
+            let target: id = msg_send![IDLE_WAKE_TARGET_CLASS, new];
+            // CADisplayLink удерживает цель до invalidate, своя ссылка на неё не нужна.
+            let link: id = msg_send![
+                native_view,
+                displayLinkWithTarget: target
+                selector: sel!(idleWakeTick:)
+            ];
+            let () = msg_send![target, release];
+            if link == nil {
+                log::error!("idle wake: NSView.displayLink returned nil");
+                return None;
+            }
+            let link: id = msg_send![link, retain];
+            let range = CAFrameRateRange {
+                minimum: 120.,
+                maximum: 120.,
+                preferred: 120.,
+            };
+            let () = msg_send![link, setPreferredFrameRateRange: range];
+            let () = msg_send![link, setPaused: YES];
+            let run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
+            let () = msg_send![link, addToRunLoop: run_loop forMode: NSRunLoopCommonModes];
+            Some(Self {
+                link,
+                paused: true,
+                deadline: None,
+            })
+        }
+    }
+
+    fn arm(&mut self, now: std::time::Instant, hold: Duration) {
+        self.deadline = Some(now + hold);
+        if self.paused {
+            unsafe {
+                let () = msg_send![self.link, setPaused: NO];
+            }
+            self.paused = false;
+        }
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        if !self.paused && self.deadline.is_none_or(|deadline| now >= deadline) {
+            self.pause();
+        }
+    }
+
+    fn pause(&mut self) {
+        if !self.paused {
+            unsafe {
+                let () = msg_send![self.link, setPaused: YES];
+            }
+            self.paused = true;
+        }
+    }
+}
+
+impl Drop for IdleWakeLink {
+    fn drop(&mut self) {
+        unsafe {
+            let () = msg_send![self.link, invalidate];
+            let () = msg_send![self.link, release];
+        }
+    }
+}
+
+extern "C" fn idle_wake_tick(_: &Object, _: Sel, _: id) {}
 
 pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -> Point<Pixels> {
     point(
@@ -396,6 +507,8 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     display_link: Option<DisplayLink>,
+    idle_wake_link: Option<IdleWakeLink>,
+    idle_wake_link_unavailable: bool,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> crate::DispatchEventResult>>,
@@ -499,6 +612,25 @@ impl MacWindowState {
 
     fn stop_display_link(&mut self) {
         self.display_link = None;
+        if let Some(idle_wake_link) = self.idle_wake_link.as_mut() {
+            idle_wake_link.pause();
+        }
+    }
+
+    /// Ввод: просить высокую частоту дисплея ещё `hold` (только `GPUI_IDLE_WAKE=link`).
+    fn arm_idle_wake(&mut self) {
+        let config = crate::idle_wake::IdleWakeConfig::global();
+        if !config.link || self.idle_wake_link_unavailable {
+            return;
+        }
+        if self.idle_wake_link.is_none() {
+            // Лениво: к первому вводу вид уже в окне, а без режима объект не создаётся вовсе.
+            self.idle_wake_link = unsafe { IdleWakeLink::new(self.native_view.as_ptr()) };
+            self.idle_wake_link_unavailable = self.idle_wake_link.is_none();
+        }
+        if let Some(idle_wake_link) = self.idle_wake_link.as_mut() {
+            idle_wake_link.arm(std::time::Instant::now(), config.hold);
+        }
     }
 
     fn is_maximized(&self) -> bool {
@@ -693,6 +825,8 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 display_link: None,
+                idle_wake_link: None,
+                idle_wake_link_unavailable: false,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -939,6 +1073,7 @@ impl Drop for MacWindow {
         this.renderer.destroy();
         let window = this.native_window;
         this.display_link.take();
+        this.idle_wake_link.take();
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1794,6 +1929,7 @@ extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: 
     let received_time_ns = crate::frame_trace::monotonic_time_ns();
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
+    lock.arm_idle_wake();
 
     let window_height = lock.content_size().height;
     let event = unsafe { PlatformInput::from_native(native_event, Some(window_height)) };
@@ -1929,6 +2065,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
     let event = unsafe { PlatformInput::from_native(native_event, Some(window_height)) };
 
     if let Some(mut event) = event {
+        lock.arm_idle_wake();
         #[cfg(feature = "frame-trace")]
         let frame_trace_input_sequence_id =
             record_native_frame_trace_input(native_event, &event, received_time_ns);
@@ -2333,6 +2470,10 @@ unsafe extern "C" fn step(view: *mut c_void) {
 
     #[cfg(not(feature = "macos-blade"))]
     lock.renderer.update_raster_compositor_transforms();
+
+    if let Some(idle_wake_link) = lock.idle_wake_link.as_mut() {
+        idle_wake_link.expire(std::time::Instant::now());
+    }
 
     // Metal отбросил drawable последнего кадра, а новее ничего не отправлено: без повторного
     // показа на экране останется предыдущий кадр до следующего изменения сцены.
@@ -2859,6 +3000,51 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             drop(lock);
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_wake_tests {
+    use super::*;
+
+    // Без окна: проверяет селекторы и передачу CAFrameRateRange, на которых опыт упал бы ночью.
+    #[test]
+    fn idle_wake_link_requests_120_hz_and_pauses_after_hold() {
+        unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let view: id = msg_send![class!(NSView), alloc];
+            let view = NSView::initWithFrame_(
+                view,
+                NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 100.)),
+            );
+            if !is_macos_version_at_least(NSOperatingSystemVersion::new(14, 0, 0)) {
+                let () = msg_send![view, release];
+                pool.drain();
+                return;
+            }
+            let mut link = IdleWakeLink::new(view).expect("NSView.displayLink");
+            let range: CAFrameRateRange = msg_send![link.link, preferredFrameRateRange];
+            assert_eq!(
+                (range.minimum, range.maximum, range.preferred),
+                (120., 120., 120.)
+            );
+            let paused: BOOL = msg_send![link.link, isPaused];
+            assert_eq!(paused, YES);
+
+            let now = std::time::Instant::now();
+            link.arm(now, Duration::from_millis(500));
+            let paused: BOOL = msg_send![link.link, isPaused];
+            assert_eq!(paused, NO);
+            link.expire(now + Duration::from_millis(499));
+            assert!(!link.paused);
+            link.expire(now + Duration::from_millis(500));
+            let paused: BOOL = msg_send![link.link, isPaused];
+            assert_eq!(paused, YES);
+
+            drop(link);
+            let () = msg_send![view, release];
+            pool.drain();
         }
     }
 }

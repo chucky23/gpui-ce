@@ -1134,6 +1134,8 @@ impl Window {
             let last_input_timestamp = last_input_timestamp.clone();
             #[cfg(feature = "frame-trace")]
             let frame_trace_display_tick = frame_trace_display_tick.clone();
+            let idle_wake = crate::idle_wake::IdleWakeConfig::global();
+            let mut last_presented_at = Instant::now();
             move |request_frame_options| {
                 #[cfg(feature = "frame-trace")]
                 frame_trace_display_tick.set(request_frame_options.trace_display_tick);
@@ -1150,12 +1152,16 @@ impl Window {
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
+                // GPUI_IDLE_WAKE=heartbeat продлевает удержание редкими повторами показа.
+                let since_input = last_input_timestamp.get().elapsed();
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || (active.get()
-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                        && (since_input < Duration::from_secs(1)
+                            || idle_wake.heartbeat_due(since_input, last_presented_at.elapsed())));
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    last_presented_at = Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1167,6 +1173,7 @@ impl Window {
                             .log_err();
                     })
                 } else if needs_present {
+                    last_presented_at = Instant::now();
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
