@@ -631,6 +631,9 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// Тесты сравнивают область пакета путей с проходом по всему кадру.
+    #[cfg(test)]
+    full_frame_path_regions: bool,
     // Keep multiple content revisions for the same logical tile alive. A retained compositor
     // frame can still reference the previous revision while a deferred command buffer builds
     // its replacement. Keying only by `(cache, tile)` removed the visible revision before the
@@ -910,6 +913,8 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            #[cfg(test)]
+            full_frame_path_regions: false,
             raster_textures: HashMap::new(),
             raster_namespaces: HashMap::new(),
             raster_compositor_layers: HashMap::new(),
@@ -1902,10 +1907,15 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::Paths(paths) => {
+                    // Пакет вне цели рендера ничего не рисует: основной проход не прерывается.
+                    let Some(region) = self.path_batch_region(paths, viewport) else {
+                        continue;
+                    };
                     command_encoder.end_encoding();
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,
+                        region,
                         instance_buffer,
                         instance_offset,
                         viewport,
@@ -1922,6 +1932,7 @@ impl MetalRenderer {
                     if did_draw {
                         self.draw_paths_from_intermediate(
                             paths,
+                            region,
                             instance_buffer,
                             instance_offset,
                             viewport,
@@ -2415,9 +2426,24 @@ impl MetalRenderer {
         }
     }
 
+    /// Область цели рендера, которой касается пакет путей; `None`, если пакет её не касается.
+    fn path_batch_region(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        viewport: Viewport,
+    ) -> Option<PathBatchRegion> {
+        #[cfg(test)]
+        if self.full_frame_path_regions {
+            return PathBatchRegion::full_frame(viewport);
+        }
+        PathBatchRegion::of_paths(paths, viewport)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        region: PathBatchRegion,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport: Viewport,
@@ -2433,6 +2459,10 @@ impl MetalRenderer {
         };
 
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        // Проход очищает, растеризует и сводит MSAA только в области пакета: она лежит в левом
+        // верхнем углу промежуточной текстуры, а не на своём месте во всём кадре.
+        render_pass_descriptor.set_render_target_width(region.width as u64);
+        render_pass_descriptor.set_render_target_height(region.height as u64);
         let color_attachment = render_pass_descriptor
             .color_attachments()
             .object_at(0)
@@ -2451,6 +2481,25 @@ impl MetalRenderer {
 
         let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: region.width as f64,
+            height: region.height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        let region_viewport = Viewport {
+            size: size(
+                DevicePixels(region.width as i32),
+                DevicePixels(region.height as i32),
+            ),
+            origin: point(
+                viewport.origin.x + ScaledPixels(region.x as f32),
+                viewport.origin.y + ScaledPixels(region.y as f32),
+            ),
+        };
+        let intermediate_origin = region.origin();
 
         for path in paths {
             align_offset(instance_offset);
@@ -2479,8 +2528,8 @@ impl MetalRenderer {
             );
             command_encoder.set_vertex_bytes(
                 PathRasterizationInputIndex::ViewportSize as u64,
-                mem::size_of_val(&viewport) as u64,
-                &viewport as *const Viewport as *const _,
+                mem::size_of_val(&region_viewport) as u64,
+                &region_viewport as *const Viewport as *const _,
             );
             command_encoder.set_vertex_bytes(
                 PathRasterizationInputIndex::Style as u64,
@@ -2491,6 +2540,11 @@ impl MetalRenderer {
                 PathRasterizationInputIndex::Style as u64,
                 mem::size_of_val(&style) as u64,
                 &style as *const PathRasterizationStyle as *const _,
+            );
+            command_encoder.set_fragment_bytes(
+                PathRasterizationInputIndex::IntermediateOrigin as u64,
+                mem::size_of_val(&intermediate_origin) as u64,
+                &intermediate_origin as *const [f32; 2] as *const _,
             );
             let buffer_contents = unsafe {
                 (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
@@ -2636,9 +2690,11 @@ impl MetalRenderer {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        region: PathBatchRegion,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport: Viewport,
@@ -2663,6 +2719,13 @@ impl MetalRenderer {
             SpriteInputIndex::ViewportSize as u64,
             mem::size_of_val(&viewport) as u64,
             &viewport as *const Viewport as *const _,
+        );
+
+        let intermediate_origin = region.origin();
+        command_encoder.set_vertex_bytes(
+            SpriteInputIndex::IntermediateOrigin as u64,
+            mem::size_of_val(&intermediate_origin) as u64,
+            &intermediate_origin as *const [f32; 2] as *const _,
         );
 
         command_encoder.set_fragment_texture(
@@ -3676,6 +3739,73 @@ mod raster_comparison_tests {
     }
 }
 
+/// Прямоугольник цели рендера в пикселях устройства, которого касается пакет путей.
+///
+/// Растеризация пакета в промежуточную текстуру ограничена этой областью: цена прохода
+/// зависит от площади путей, а не от размера кадра.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PathBatchRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl PathBatchRegion {
+    /// Объединение обрезанных границ путей, расширенное до целых пикселей с запасом в пиксель
+    /// и обрезанное целью рендера. Запас покрывает округление позиций выборок в шейдере.
+    fn of_paths(paths: &[Path<ScaledPixels>], viewport: Viewport) -> Option<Self> {
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            if bounds.is_empty() {
+                continue;
+            }
+            let x = bounds.origin.x.0 - viewport.origin.x.0;
+            let y = bounds.origin.y.0 - viewport.origin.y.0;
+            min[0] = min[0].min(x);
+            min[1] = min[1].min(y);
+            max[0] = max[0].max(x + bounds.size.width.0);
+            max[1] = max[1].max(y + bounds.size.height.0);
+        }
+        let target = [
+            viewport.size.width.0.max(0) as f32,
+            viewport.size.height.0.max(0) as f32,
+        ];
+        let x0 = (min[0].floor() - 1.0).max(0.0);
+        let y0 = (min[1].floor() - 1.0).max(0.0);
+        let x1 = (max[0].ceil() + 1.0).min(target[0]);
+        let y1 = (max[1].ceil() + 1.0).min(target[1]);
+        // Сравнение отбрасывает и пустое объединение, и NaN.
+        if !(x1 > x0 && y1 > y0) {
+            return None;
+        }
+        Some(Self {
+            x: x0 as u32,
+            y: y0 as u32,
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        })
+    }
+
+    #[cfg(test)]
+    fn full_frame(viewport: Viewport) -> Option<Self> {
+        let width = viewport.size.width.0.max(0) as u32;
+        let height = viewport.size.height.0.max(0) as u32;
+        (width > 0 && height > 0).then_some(Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })
+    }
+
+    fn origin(&self) -> [f32; 2] {
+        [self.x as f32, self.y as f32]
+    }
+}
+
 fn scene_needs_path_intermediate(scene: &Scene) -> bool {
     !scene.paths.is_empty()
 }
@@ -3806,6 +3936,7 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
+    IntermediateOrigin = 5,
 }
 
 #[repr(C)]
@@ -3823,6 +3954,7 @@ enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
     Style = 2,
+    IntermediateOrigin = 3,
 }
 
 #[repr(C)]
@@ -3856,4 +3988,229 @@ pub struct RasterTileBounds {
     pub source_size: Size<DevicePixels>,
     pub gutter: DevicePixels,
     pub _padding: DevicePixels,
+}
+
+#[cfg(test)]
+mod path_region_tests {
+    use super::*;
+    use crate::{
+        Corners, Edges, TransformationMatrix, hsla, linear_color_stop, linear_gradient, px,
+    };
+
+    const WIDTH: i32 = 160;
+    const HEIGHT: i32 = 120;
+
+    fn viewport() -> Viewport {
+        Viewport {
+            size: size(DevicePixels(WIDTH), DevicePixels(HEIGHT)),
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+        }
+    }
+
+    fn mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(WIDTH as f32), ScaledPixels(HEIGHT as f32)),
+            ),
+        }
+    }
+
+    fn curved_path(origin: (f32, f32), extent: f32, color: Background) -> Path<ScaledPixels> {
+        let (x, y) = origin;
+        let mut path = crate::Path::new(point(px(x), px(y)));
+        path.line_to(point(px(x + extent), px(y + extent * 0.15)));
+        path.curve_to(
+            point(px(x + extent * 0.4), px(y + extent)),
+            point(px(x + extent * 1.1), px(y + extent * 0.9)),
+        );
+        path.line_to(point(px(x), px(y)));
+        let mut path = path.scale(1.);
+        path.color = color;
+        path.content_mask = mask();
+        path
+    }
+
+    fn region_of(path: &Path<ScaledPixels>) -> Option<PathBatchRegion> {
+        PathBatchRegion::of_paths(std::slice::from_ref(path), viewport())
+    }
+
+    #[test]
+    fn region_rounds_clipped_bounds_out_with_pixel_margin() {
+        let mut path = curved_path((10.25, 20.5), 30., hsla(0., 1., 0.5, 1.).into());
+        path.bounds = Bounds::new(
+            point(ScaledPixels(10.25), ScaledPixels(20.5)),
+            size(ScaledPixels(10.5), ScaledPixels(5.)),
+        );
+        assert_eq!(
+            region_of(&path),
+            Some(PathBatchRegion {
+                x: 9,
+                y: 19,
+                width: 13,
+                height: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn region_is_clamped_to_target_and_skips_batches_outside_it() {
+        let edge = curved_path((140., 100.), 60., hsla(0., 1., 0.5, 1.).into());
+        let region = region_of(&edge).expect("path crosses the corner of the target");
+        assert_eq!(
+            (region.x + region.width, region.y + region.height),
+            (WIDTH as u32, HEIGHT as u32)
+        );
+
+        let mut outside = curved_path((200., 10.), 20., hsla(0., 1., 0.5, 1.).into());
+        outside.content_mask.bounds.size.width = ScaledPixels(1000.);
+        assert_eq!(region_of(&outside), None);
+    }
+
+    #[test]
+    fn region_is_relative_to_viewport_origin() {
+        let path = curved_path((50., 40.), 10., hsla(0., 1., 0.5, 1.).into());
+        let mut viewport = viewport();
+        viewport.origin = point(ScaledPixels(20.), ScaledPixels(10.));
+        let region = PathBatchRegion::of_paths(std::slice::from_ref(&path), viewport)
+            .expect("path is inside the target");
+        assert_eq!((region.x, region.y), (29, 29));
+    }
+
+    fn render(renderer: &mut MetalRenderer, scene: &Scene) -> Vec<u8> {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(WIDTH as u64);
+        descriptor.set_height(HEIGHT as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = renderer.device.new_texture(&descriptor);
+        let mut instance_buffer = renderer
+            .instance_buffer_pool
+            .lock()
+            .acquire(&renderer.device);
+        let command_buffer = renderer.command_queue.new_command_buffer().to_owned();
+        let mut offset = 0;
+        renderer
+            .encode_scene(
+                scene,
+                &texture,
+                viewport(),
+                &command_buffer,
+                &mut instance_buffer,
+                &mut offset,
+                1.,
+            )
+            .expect("scene fits the instance buffer");
+        let bytes_per_row = WIDTH as u64 * 4;
+        let length = bytes_per_row * HEIGHT as u64;
+        let readback = renderer
+            .device
+            .new_buffer(length, metal::MTLResourceOptions::StorageModeShared);
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            &texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: WIDTH as u64,
+                height: HEIGHT as u64,
+                depth: 1,
+            },
+            &readback,
+            0,
+            bytes_per_row,
+            length,
+            metal::MTLBlitOption::empty(),
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        renderer
+            .instance_buffer_pool
+            .lock()
+            .release(instance_buffer);
+        unsafe { std::slice::from_raw_parts(readback.contents() as *const u8, length as usize) }
+            .to_vec()
+    }
+
+    /// Пакеты путей, разделённые квадом, с градиентом и выходом за край цели.
+    fn scene_with_path_batches() -> Scene {
+        let mut scene = Scene::default();
+        scene.insert_primitive(curved_path(
+            (12.5, 8.25),
+            50.,
+            linear_gradient(
+                45.,
+                linear_color_stop(hsla(0.6, 0.9, 0.5, 1.), 0.),
+                linear_color_stop(hsla(0.1, 0.9, 0.6, 0.7), 1.),
+            ),
+        ));
+        scene.insert_primitive(Quad {
+            order: 0,
+            border_style: Default::default(),
+            bounds: Bounds::new(
+                point(ScaledPixels(30.), ScaledPixels(30.)),
+                size(ScaledPixels(70.), ScaledPixels(50.)),
+            ),
+            content_mask: mask(),
+            background: hsla(0.3, 0.5, 0.5, 0.6).into(),
+            border_color: Default::default(),
+            corner_radii: Corners::default(),
+            border_widths: Edges::default(),
+            transformation: TransformationMatrix::unit(),
+        });
+        scene.insert_primitive(curved_path(
+            (60.75, 50.5),
+            40.,
+            hsla(0.9, 0.8, 0.5, 0.8).into(),
+        ));
+        scene.insert_primitive(curved_path(
+            (130.3, 95.6),
+            45.,
+            hsla(0.5, 0.8, 0.4, 1.).into(),
+        ));
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn path_batch_region_renders_like_full_frame_pass() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let scene = scene_with_path_batches();
+        let path_batches = scene
+            .batches()
+            .filter(|batch| matches!(batch, PrimitiveBatch::Paths(_)))
+            .count();
+        assert!(path_batches >= 2, "scene has {path_batches} path batches");
+
+        let pool = Arc::new(Mutex::new(InstanceBufferPool {
+            buffer_size: 4 * 1024 * 1024,
+            buffers: Vec::new(),
+        }));
+        let mut renderer = MetalRenderer::new(pool);
+        renderer.full_frame_path_regions = true;
+        let reference = render(&mut renderer, &scene);
+        renderer.full_frame_path_regions = false;
+        let candidate = render(&mut renderer, &scene);
+
+        let painted = reference
+            .chunks_exact(4)
+            .filter(|pixel| pixel[..3] != [0, 0, 0])
+            .count();
+        assert!(painted > 1000, "paths painted only {painted} pixels");
+        let differing = reference
+            .iter()
+            .zip(&candidate)
+            .filter(|(reference, candidate)| reference != candidate)
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{differing} channels differ from the full-frame pass"
+        );
+    }
 }

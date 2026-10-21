@@ -774,9 +774,12 @@ vertex PathRasterizationVertexOutput path_rasterization_vertex(
   };
 }
 
+// Промежуточная текстура держит только область пакета путей с началом в
+// `intermediate_origin` цели рендера: заливка получает координаты цели, как без области.
 fragment float4 path_rasterization_fragment(
   PathRasterizationFragmentInput input [[stage_in]],
-  constant PathRasterizationStyle *style [[buffer(PathRasterizationInputIndex_Style)]]
+  constant PathRasterizationStyle *style [[buffer(PathRasterizationInputIndex_Style)]],
+  constant float2 *intermediate_origin [[buffer(PathRasterizationInputIndex_IntermediateOrigin)]]
 ) {
   float2 dx = dfdx(input.st_position);
   float2 dy = dfdy(input.st_position);
@@ -806,7 +809,7 @@ fragment float4 path_rasterization_fragment(
 
   float4 color = fill_color(
     background,
-    input.position.xy,
+    input.position.xy + *intermediate_origin,
     path_bounds,
     gradient_color.solid,
     gradient_color.color0,
@@ -825,7 +828,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
   uint sprite_id [[instance_id]],
   constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
   constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
-  constant Viewport *viewport [[buffer(SpriteInputIndex_ViewportSize)]]
+  constant Viewport *viewport [[buffer(SpriteInputIndex_ViewportSize)]],
+  constant float2 *intermediate_origin [[buffer(SpriteInputIndex_IntermediateOrigin)]]
 ) {
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   PathSprite sprite = sprites[sprite_id];
@@ -835,8 +839,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
       to_device_position(unit_vertex, sprite.bounds, viewport);
 
   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = (screen_position - float2(viewport->origin.x, viewport->origin.y)) /
-    float2(viewport->size.width, viewport->size.height);
+  float2 texture_coords = (screen_position - float2(viewport->origin.x, viewport->origin.y) -
+    *intermediate_origin) / float2(viewport->size.width, viewport->size.height);
 
   return PathSpriteVertexOutput{
     device_position,
