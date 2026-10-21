@@ -610,6 +610,36 @@ impl InstanceBufferPool {
     }
 }
 
+/// Переменная окружения с `maximumDrawableCount` корневого слоя окна: `2` или `3`.
+const DRAWABLE_COUNT_ENV: &str = "GPUI_DRAWABLE_COUNT";
+const DEFAULT_ROOT_DRAWABLE_COUNT: u64 = 2;
+
+fn root_drawable_count() -> u64 {
+    static COUNT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let value = std::env::var(DRAWABLE_COUNT_ENV).ok();
+        let count = parse_root_drawable_count(value.as_deref());
+        if value.is_some() {
+            log::info!("{DRAWABLE_COUNT_ENV}: root layer maximumDrawableCount = {count}");
+        }
+        count
+    })
+}
+
+fn parse_root_drawable_count(value: Option<&str>) -> u64 {
+    match value {
+        None => DEFAULT_ROOT_DRAWABLE_COUNT,
+        Some("2") => 2,
+        Some("3") => 3,
+        Some(other) => {
+            log::error!(
+                "{DRAWABLE_COUNT_ENV}={other:?} is not 2 or 3, using {DEFAULT_ROOT_DRAWABLE_COUNT}"
+            );
+            DEFAULT_ROOT_DRAWABLE_COUNT
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DrawableMiss {
     Unavailable,
@@ -723,7 +753,8 @@ impl MetalRenderer {
         // Two drawables bound presentation latency to one queued frame. The previous third
         // drawable improved throughput only when GPU work approached the refresh budget, while
         // adding a full frame of latency to interactive surfaces with short GPU workloads.
-        layer.set_maximum_drawable_count(2);
+        // `GPUI_DRAWABLE_COUNT=3` возвращает третий буфер для сравнения одной сборкой.
+        layer.set_maximum_drawable_count(root_drawable_count());
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
@@ -3858,6 +3889,15 @@ mod raster_comparison_tests {
             dropped.flags & crate::frame_trace::FLAG_DRAWABLE_ID_MISMATCH,
             0
         );
+    }
+
+    #[test]
+    fn root_drawable_count_accepts_only_two_or_three() {
+        assert_eq!(parse_root_drawable_count(None), 2);
+        assert_eq!(parse_root_drawable_count(Some("2")), 2);
+        assert_eq!(parse_root_drawable_count(Some("3")), 3);
+        assert_eq!(parse_root_drawable_count(Some("4")), 2);
+        assert_eq!(parse_root_drawable_count(Some("")), 2);
     }
 
     #[cfg(feature = "frame-trace")]
