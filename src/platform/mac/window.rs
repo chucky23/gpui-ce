@@ -423,6 +423,10 @@ struct MacWindowState {
     select_previous_tab_callback: Option<Box<dyn FnMut()>>,
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
+    /// Такт DisplayLink, переданный последнему запросу кадра из `step`. Повтор показа,
+    /// отложенного из-за неготового drawable, относится к этому же такту.
+    #[cfg(feature = "frame-trace")]
+    last_requested_trace_display_tick: Option<crate::frame_trace::FrameTraceDisplayTick>,
 }
 
 impl MacWindowState {
@@ -729,6 +733,8 @@ impl MacWindow {
                 select_previous_tab_callback: None,
                 toggle_tab_bar_callback: None,
                 activated_least_once: false,
+                #[cfg(feature = "frame-trace")]
+                last_requested_trace_display_tick: None,
             })));
 
             (*native_window).set_ivar(
@@ -740,6 +746,16 @@ impl MacWindow {
                 WINDOW_STATE_IVAR,
                 Arc::into_raw(window.0.clone()) as *const c_void,
             );
+
+            #[cfg(not(feature = "macos-blade"))]
+            {
+                let window_state = MainThreadWindowState(Arc::downgrade(&window.0));
+                window
+                    .0
+                    .lock()
+                    .renderer
+                    .start_drawable_prefetch(move || window_state.request_frame_on_main_thread());
+            }
 
             if let Some(title) = titlebar
                 .as_ref()
@@ -1672,6 +1688,43 @@ unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
     }
 }
 
+/// Слабая ссылка на состояние окна для вспомогательного потока. Состояние разыменовывается
+/// только на главном потоке, в `request_frame_on_main_thread_callback`.
+#[cfg(not(feature = "macos-blade"))]
+struct MainThreadWindowState(std::sync::Weak<Mutex<MacWindowState>>);
+
+// SAFETY: из другого потока ссылка только клонируется и освобождается: счётчики `Arc`
+// атомарны. `upgrade` и доступ к состоянию выполняются на главном потоке.
+#[cfg(not(feature = "macos-blade"))]
+unsafe impl Send for MainThreadWindowState {}
+
+#[cfg(not(feature = "macos-blade"))]
+impl MainThreadWindowState {
+    fn request_frame_on_main_thread(&self) {
+        let context = Box::into_raw(Box::new(MainThreadWindowState(self.0.clone())));
+        unsafe {
+            dispatch_async_f(
+                dispatch_get_main_queue(),
+                context as *mut c_void,
+                Some(request_frame_on_main_thread_callback),
+            );
+        }
+    }
+}
+
+#[cfg(not(feature = "macos-blade"))]
+unsafe extern "C" fn request_frame_on_main_thread_callback(context: *mut c_void) {
+    let window_state = unsafe { Box::from_raw(context as *mut MainThreadWindowState) };
+    let Some(window_state) = window_state.0.upgrade() else {
+        return;
+    };
+    // Остановленный DisplayLink (окно скрыто или идёт синхронный кадр) не теряет показ:
+    // признак отложенного показа прочитает первый такт после запуска.
+    if let Some(display_link) = window_state.lock().display_link.as_ref() {
+        display_link.request_frame();
+    }
+}
+
 unsafe fn drop_window_state(object: &Object) {
     unsafe {
         let raw: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
@@ -2322,7 +2375,7 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let mut lock = window_state.lock();
 
     #[cfg(feature = "frame-trace")]
-    let trace_display_tick = lock
+    let mut trace_display_tick = lock
         .display_link
         .as_mut()
         .and_then(DisplayLink::take_trace_delivery);
@@ -2335,11 +2388,27 @@ unsafe extern "C" fn step(view: *mut c_void) {
     lock.renderer.update_raster_compositor_transforms();
 
     // Metal отбросил drawable последнего кадра, а новее ничего не отправлено: без повторного
-    // показа на экране останется предыдущий кадр до следующего изменения сцены.
+    // показа на экране останется предыдущий кадр до следующего изменения сцены. Отложенный из-за
+    // неготового drawable показ повторяется так же. Оба признака сбрасываются.
     #[cfg(not(feature = "macos-blade"))]
-    let require_presentation = lock.renderer.take_dropped_latest_frame();
+    let deferred_presentation = lock.renderer.take_deferred_presentation();
+    #[cfg(feature = "macos-blade")]
+    #[allow(unused_variables)]
+    let deferred_presentation = false;
+    #[cfg(not(feature = "macos-blade"))]
+    let require_presentation = lock.renderer.take_dropped_latest_frame() | deferred_presentation;
     #[cfg(feature = "macos-blade")]
     let require_presentation = false;
+
+    // Сигнал готовности drawable приходит между тактами. Повтор показа без нового такта
+    // нацелен на тот же такт, что и отложенная попытка, как и блокирующий `nextDrawable`.
+    #[cfg(feature = "frame-trace")]
+    {
+        if deferred_presentation && trace_display_tick.is_none() {
+            trace_display_tick = lock.last_requested_trace_display_tick;
+        }
+        lock.last_requested_trace_display_tick = trace_display_tick;
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
