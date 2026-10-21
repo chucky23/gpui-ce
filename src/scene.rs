@@ -223,8 +223,10 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        // Маска содержимого задана на экране, после преобразования примитива: отсечение и
+        // порядок считаются по экранной охватывающей рамке, а не по границам до преобразования.
         let clipped_bounds = primitive
-            .bounds()
+            .screen_bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
@@ -543,6 +545,21 @@ impl Primitive {
             Primitive::Surface(surface) => &surface.bounds,
             Primitive::RasterTile(tile) => &tile.bounds,
         }
+    }
+
+    /// Охватывающая рамка примитива на экране: границы после его преобразования.
+    pub fn screen_bounds(&self) -> Bounds<ScaledPixels> {
+        let transformation = match self {
+            Primitive::Shadow(shadow) => &shadow.transformation,
+            Primitive::Quad(quad) => &quad.transformation,
+            Primitive::MonochromeSprite(sprite) => &sprite.transformation,
+            Primitive::PolychromeSprite(sprite) => &sprite.transformation,
+            Primitive::Path(_)
+            | Primitive::Underline(_)
+            | Primitive::Surface(_)
+            | Primitive::RasterTile(_) => return *self.bounds(),
+        };
+        transformation.bounding_box(self.bounds())
     }
 
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
@@ -1124,6 +1141,32 @@ impl TransformationMatrix {
         }
     }
 
+    /// Охватывающая рамка `bounds` после преобразования, как его применяют шейдеры.
+    pub(crate) fn bounding_box(&self, bounds: &Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        if *self == Self::unit() {
+            return *bounds;
+        }
+        let x0 = bounds.origin.x.0;
+        let y0 = bounds.origin.y.0;
+        let x1 = x0 + bounds.size.width.0;
+        let y1 = y0 + bounds.size.height.0;
+        let mut min = [f32::INFINITY; 2];
+        let mut max = [f32::NEG_INFINITY; 2];
+        for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+            for axis in 0..2 {
+                let value = self.rotation_scale[axis][0] * x
+                    + self.rotation_scale[axis][1] * y
+                    + self.translation[axis];
+                min[axis] = min[axis].min(value);
+                max[axis] = max[axis].max(value);
+            }
+        }
+        Bounds::new(
+            point(ScaledPixels(min[0]), ScaledPixels(min[1])),
+            Size::new(ScaledPixels(max[0] - min[0]), ScaledPixels(max[1] - min[1])),
+        )
+    }
+
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
         let input = [point.x.0, point.y.0];
@@ -1422,6 +1465,78 @@ mod tests {
             scaled_point(x, y),
             Size::new(ScaledPixels(width), ScaledPixels(height)),
         )
+    }
+
+    fn window_mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: scaled_bounds(0., 0., 100., 100.),
+        }
+    }
+
+    fn scaled_quad(bounds: Bounds<ScaledPixels>, translation: (f32, f32), scale: f32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: window_mask(),
+            transformation: TransformationMatrix::unit()
+                .translate(scaled_point(translation.0, translation.1))
+                .scale(Size::new(scale, scale)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transformed_quad_visible_at_window_edge_is_not_culled() {
+        // До преобразования квад целиком левее и выше окна, после — заходит в его угол.
+        let quad = scaled_quad(scaled_bounds(-30., -30., 20., 20.), (50., 50.), 2.);
+        assert!(quad.bounds.intersect(&quad.content_mask.bounds).is_empty());
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad);
+        assert_eq!(scene.quads.len(), 1);
+    }
+
+    #[test]
+    fn transformed_quad_moved_out_of_window_is_culled() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(scaled_quad(
+            scaled_bounds(80., 80., 10., 10.),
+            (100., 0.),
+            1.,
+        ));
+        assert!(scene.quads.is_empty());
+    }
+
+    #[test]
+    fn draw_order_follows_screen_bounds_of_transformed_primitives() {
+        let mut scene = Scene::default();
+        // Одинаковые границы до преобразования, на экране не пересекаются.
+        scene.insert_primitive(scaled_quad(scaled_bounds(0., 0., 10., 10.), (0., 0.), 2.));
+        scene.insert_primitive(scaled_quad(scaled_bounds(0., 0., 10., 10.), (50., 0.), 2.));
+        // На экране пересекает первый квад (0..20), до преобразования лежал бы вне его.
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(15., 15., 10., 10.),
+            content_mask: window_mask(),
+            ..Default::default()
+        });
+        let orders: Vec<_> = scene.quads.iter().map(|quad| quad.order).collect();
+        assert_eq!(orders[0], orders[1]);
+        assert!(orders[2] > orders[0]);
+    }
+
+    #[test]
+    fn bounding_box_covers_rotated_and_scaled_bounds() {
+        let unit = TransformationMatrix::unit();
+        let bounds = scaled_bounds(0., 0., 10., 20.);
+        assert_eq!(unit.bounding_box(&bounds), bounds);
+
+        let rotated = unit
+            .translate(scaled_point(5., 0.))
+            .rotate(Radians(std::f32::consts::FRAC_PI_2))
+            .bounding_box(&bounds);
+        let close = |a: ScaledPixels, b: f32| (a.0 - b).abs() < 1e-4;
+        assert!(close(rotated.origin.x, -15.), "{rotated:?}");
+        assert!(close(rotated.origin.y, 0.), "{rotated:?}");
+        assert!(close(rotated.size.width, 20.), "{rotated:?}");
+        assert!(close(rotated.size.height, 10.), "{rotated:?}");
     }
 
     #[test]
