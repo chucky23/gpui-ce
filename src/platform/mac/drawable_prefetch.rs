@@ -109,6 +109,29 @@ impl<D: Send + 'static> DrawablePrefetcher<D> {
         Ok(Self { shared })
     }
 
+    /// Готов ли drawable, пригодный по `usable`, не забирая его. Если нет, запрашивает его и
+    /// включает сигнал готовности: кадр стоит строить по сигналу, а не на выброс. Пустой
+    /// результат прошлого получения тоже даёт `true`, чтобы показ сообщил о нём, как прежде.
+    pub(crate) fn poll_ready(&self, usable: impl Fn(&D) -> bool) -> bool {
+        let mut state = self.shared.lock();
+        let stale = match state.ready.take() {
+            Some(drawable) if usable(&drawable) => {
+                state.ready = Some(drawable);
+                return true;
+            }
+            stale => stale,
+        };
+        if state.last_acquire_failed {
+            return true;
+        }
+        state.request_acquire();
+        state.presentation_waiting = true;
+        drop(state);
+        self.shared.changed.notify_all();
+        drop(stale);
+        false
+    }
+
     /// Берёт готовый drawable без ожидания. Drawable, для которого `usable` ложно (размер слоя
     /// сменился после взятия), выбрасывается, и запрашивается новый.
     pub(crate) fn try_take(&self, usable: impl Fn(&D) -> bool) -> DrawableTake<D> {
@@ -352,6 +375,50 @@ mod tests {
         source.complete(Some(1));
         source.wait_ready_signal();
         assert_eq!(prefetcher.try_take(|_| true), DrawableTake::Ready(1));
+    }
+
+    #[test]
+    fn poll_without_drawable_requests_it_and_signals_without_consuming() {
+        let (prefetcher, source) = scripted_prefetcher();
+        assert!(!prefetcher.poll_ready(|_| true));
+        source.wait_acquire_started();
+        assert!(!prefetcher.poll_ready(|_| true));
+
+        source.complete(Some(1));
+        source.wait_ready_signal();
+        assert!(prefetcher.poll_ready(|_| true));
+        assert!(prefetcher.poll_ready(|_| true));
+        source.assert_no_ready_signal();
+        assert_eq!(prefetcher.try_take(|_| true), DrawableTake::Ready(1));
+        assert_eq!(source.acquire_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poll_replaces_stale_drawable_and_signals() {
+        let (prefetcher, source) = scripted_prefetcher();
+        prime(&prefetcher, &source, 1);
+
+        assert!(!prefetcher.poll_ready(|drawable| *drawable == 2));
+        source.wait_acquire_started();
+        source.complete(Some(2));
+        source.wait_ready_signal();
+        assert!(prefetcher.poll_ready(|drawable| *drawable == 2));
+        assert_eq!(
+            prefetcher.try_take(|drawable| *drawable == 2),
+            DrawableTake::Ready(2)
+        );
+    }
+
+    #[test]
+    fn poll_lets_failed_acquisition_reach_the_frame() {
+        let (prefetcher, source) = scripted_prefetcher();
+        assert!(!prefetcher.poll_ready(|_| true));
+        source.wait_acquire_started();
+        source.complete(None);
+        source.wait_ready_signal();
+
+        assert!(prefetcher.poll_ready(|_| true));
+        assert_eq!(prefetcher.try_take(|_| true), DrawableTake::Unavailable);
     }
 
     #[test]
