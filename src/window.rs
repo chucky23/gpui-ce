@@ -1135,6 +1135,8 @@ impl Window {
             #[cfg(feature = "frame-trace")]
             let frame_trace_display_tick = frame_trace_display_tick.clone();
             let keepalive_present = crate::keepalive_present::KeepalivePresentMode::global();
+            let idle_wake = crate::idle_wake::IdleWakeConfig::global();
+            let mut last_presented_at = Instant::now();
             move |request_frame_options| {
                 #[cfg(feature = "frame-trace")]
                 frame_trace_display_tick.set(request_frame_options.trace_display_tick);
@@ -1153,8 +1155,13 @@ impl Window {
                 // last input to prevent the display from underclocking the refresh rate.
                 // Повтор, который ждал бы drawable, пропускается: иначе ввод ждёт за ним, и
                 // новая сцена строится через такт (GPUI_KEEPALIVE_PRESENT=block — прежнее).
-                let keepalive =
-                    active.get() && last_input_timestamp.get().elapsed() < Duration::from_secs(1);
+                // GPUI_IDLE_WAKE=heartbeat продлевает удержание редкими повторами показа,
+                // и они тоже не ждут drawable.
+                let keepalive = active.get()
+                    && idle_wake.keepalive_due(
+                        last_input_timestamp.get().elapsed(),
+                        last_presented_at.elapsed(),
+                    );
                 let needs_present = keepalive_present.should_present(
                     request_frame_options.require_presentation || needs_present.get(),
                     keepalive,
@@ -1162,6 +1169,7 @@ impl Window {
                 );
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    last_presented_at = Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1173,6 +1181,7 @@ impl Window {
                             .log_err();
                     })
                 } else if needs_present {
+                    last_presented_at = Instant::now();
                     handle
                         .update(&mut cx, |_, window, _| window.present())
                         .log_err();
