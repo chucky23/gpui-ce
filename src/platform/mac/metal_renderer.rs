@@ -270,6 +270,40 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Сколько раз подряд показывать заново сцену, чей последний drawable Metal отбросил.
 const MAX_DROPPED_FRAME_REPRESENTS: u64 = 3;
 
+/// Очередь показа корневого слоя: порядковые номера отправленных кадров и последнего, чей
+/// drawable Metal показал или отбросил. Metal показывает drawable по порядку, поэтому итог
+/// позднего кадра закрывает и все ранние, даже если обработчик раннего не пришёл.
+#[derive(Default)]
+struct RootPresentationQueue {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+}
+
+impl RootPresentationQueue {
+    /// Отправка кадра на показ. Вызывает только главный поток. Возвращает номер кадра в очереди.
+    fn submit(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Итог показа кадра с номером `sequence`. Вызывает обработчик показа Metal.
+    fn complete(&self, sequence: u64) {
+        self.completed.fetch_max(sequence, Ordering::AcqRel);
+    }
+
+    fn in_flight(&self) -> u64 {
+        let completed = self.completed.load(Ordering::Acquire);
+        self.submitted
+            .load(Ordering::Acquire)
+            .saturating_sub(completed)
+    }
+}
+
+/// Ждал бы `nextDrawable` свободный drawable. Кадр на экране держит свой drawable, пока его не
+/// сменит следующий показ, поэтому очередь вмещает `maximum_drawable_count - 1` кадров.
+fn root_presentation_would_block(in_flight: u64, maximum_drawable_count: u64) -> bool {
+    in_flight >= maximum_drawable_count.saturating_sub(1).max(1)
+}
+
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
@@ -654,6 +688,7 @@ pub(crate) struct MetalRenderer {
     /// Сколько последних кадров подряд отброшено. Сбрасывается любым показанным кадром и
     /// ограничивает повторы, чтобы скрытое окно не перерисовывалось на каждом такте.
     consecutive_dropped_frames: Arc<AtomicU64>,
+    root_presentation_queue: Arc<RootPresentationQueue>,
     #[cfg(feature = "frame-trace")]
     frame_trace_renderer_instance_id: u64,
     #[cfg(feature = "frame-trace")]
@@ -925,6 +960,7 @@ impl MetalRenderer {
             last_submitted_frame: Arc::new(AtomicU64::new(0)),
             dropped_latest_frame: Arc::new(AtomicU64::new(0)),
             consecutive_dropped_frames: Arc::new(AtomicU64::new(0)),
+            root_presentation_queue: Arc::default(),
             #[cfg(feature = "frame-trace")]
             frame_trace_renderer_instance_id: crate::frame_trace::next_renderer_instance_id(),
             #[cfg(feature = "frame-trace")]
@@ -1085,6 +1121,16 @@ impl MetalRenderer {
     /// на экране остался предыдущий кадр, и сцену нужно показать ещё раз. Сбрасывает признак.
     pub fn take_dropped_latest_frame(&self) -> bool {
         self.dropped_latest_frame.swap(0, Ordering::AcqRel) != 0
+    }
+
+    /// Ждал бы показ сейчас свободный drawable корневого слоя: все, кроме кадра на экране, ещё в
+    /// очереди показа. Обработчик показа приходит чуть позже освобождения drawable, поэтому
+    /// ответ осторожный: «ждал бы» может длиться ещё доли миллисекунды после освобождения.
+    pub fn root_presentation_would_block(&self) -> bool {
+        root_presentation_would_block(
+            self.root_presentation_queue.in_flight(),
+            self.layer.maximum_drawable_count(),
+        )
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -1369,6 +1415,8 @@ impl MetalRenderer {
                     let last_submitted_frame = self.last_submitted_frame.clone();
                     let dropped_latest_frame = self.dropped_latest_frame.clone();
                     let consecutive_dropped_frames = self.consecutive_dropped_frames.clone();
+                    let root_presentation_queue = self.root_presentation_queue.clone();
+                    let root_presentation_sequence = self.root_presentation_queue.submit();
                     let measured_command_buffer = command_buffer.to_owned();
                     #[cfg(feature = "frame-trace")]
                     let trace_drawable_id =
@@ -1390,6 +1438,7 @@ impl MetalRenderer {
                         self.frame_trace_presentation_queue_depth.clone();
                     let presented =
                         ConcreteBlock::new(move |presented_drawable: &metal::DrawableRef| {
+                            root_presentation_queue.complete(root_presentation_sequence);
                             // presentedTime == 0: drawable отброшен. Если это последний отправленный
                             // кадр, его содержимое так и не попадёт на экран без повторного показа.
                             if presented_drawable.presented_time() > 0. {
@@ -3486,6 +3535,48 @@ fn compare_bgra_images(
         ssim_ppb: (ssim * 1_000_000_000.).round() as u32,
         p99_channel_error: p99_channel_error.unwrap_or(max_channel_error),
         max_channel_error,
+    }
+}
+
+#[cfg(test)]
+mod root_presentation_queue_tests {
+    use super::*;
+
+    #[test]
+    fn queue_counts_frames_until_their_presentation_outcome() {
+        let queue = RootPresentationQueue::default();
+        assert_eq!(queue.in_flight(), 0);
+        let first = queue.submit();
+        let second = queue.submit();
+        assert_eq!(queue.in_flight(), 2);
+        queue.complete(first);
+        assert_eq!(queue.in_flight(), 1);
+        queue.complete(second);
+        assert_eq!(queue.in_flight(), 0);
+    }
+
+    #[test]
+    fn later_outcome_closes_earlier_frames_and_late_callback_does_not_reopen_them() {
+        let queue = RootPresentationQueue::default();
+        let first = queue.submit();
+        let second = queue.submit();
+        queue.complete(second);
+        assert_eq!(queue.in_flight(), 0);
+        queue.complete(first);
+        assert_eq!(queue.in_flight(), 0);
+        queue.submit();
+        assert_eq!(queue.in_flight(), 1);
+    }
+
+    #[test]
+    fn presentation_waits_when_every_drawable_but_the_screen_one_is_queued() {
+        assert!(!root_presentation_would_block(0, 2));
+        assert!(root_presentation_would_block(1, 2));
+        assert!(!root_presentation_would_block(1, 3));
+        assert!(root_presentation_would_block(2, 3));
+        // Слой с одним drawable не бывает, но и тогда очередь не считается бесконечной.
+        assert!(root_presentation_would_block(1, 1));
+        assert!(!root_presentation_would_block(0, 1));
     }
 }
 

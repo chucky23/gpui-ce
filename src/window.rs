@@ -1134,6 +1134,7 @@ impl Window {
             let last_input_timestamp = last_input_timestamp.clone();
             #[cfg(feature = "frame-trace")]
             let frame_trace_display_tick = frame_trace_display_tick.clone();
+            let keepalive_present = crate::keepalive_present::KeepalivePresentMode::global();
             move |request_frame_options| {
                 #[cfg(feature = "frame-trace")]
                 frame_trace_display_tick.set(request_frame_options.trace_display_tick);
@@ -1150,10 +1151,14 @@ impl Window {
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
-                let needs_present = request_frame_options.require_presentation
-                    || needs_present.get()
-                    || (active.get()
-                        && last_input_timestamp.get().elapsed() < Duration::from_secs(1));
+                // GPUI_KEEPALIVE_PRESENT=nonblocking не ждёт drawable ради такого повтора.
+                let keepalive =
+                    active.get() && last_input_timestamp.get().elapsed() < Duration::from_secs(1);
+                let needs_present = keepalive_present.should_present(
+                    request_frame_options.require_presentation || needs_present.get(),
+                    keepalive,
+                    request_frame_options.presentation_would_block,
+                );
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
                     measure("frame duration", || {

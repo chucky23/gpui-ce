@@ -2340,18 +2340,24 @@ unsafe extern "C" fn step(view: *mut c_void) {
     let require_presentation = lock.renderer.take_dropped_latest_frame();
     #[cfg(feature = "macos-blade")]
     let require_presentation = false;
+    #[cfg(not(feature = "macos-blade"))]
+    let presentation_would_block = lock.renderer.root_presentation_would_block();
+    #[cfg(feature = "macos-blade")]
+    let presentation_would_block = false;
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         #[cfg(feature = "frame-trace")]
         callback(RequestFrameOptions {
             require_presentation,
+            presentation_would_block,
             trace_display_tick,
             ..Default::default()
         });
         #[cfg(not(feature = "frame-trace"))]
         callback(RequestFrameOptions {
             require_presentation,
+            presentation_would_block,
             ..Default::default()
         });
         window_state.lock().request_frame_callback = Some(callback);

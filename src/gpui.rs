@@ -27,6 +27,7 @@ mod global;
 mod input;
 mod inspector;
 mod interactive;
+mod keepalive_present;
 mod key_dispatch;
 mod keymap;
 mod path_builder;
