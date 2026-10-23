@@ -396,11 +396,15 @@ impl Scene {
         content_mask: ContentMask<ScaledPixels>,
         transformation: TransformationMatrix,
     ) {
+        // Слои записаны рамками на экране, спрайты — границами до преобразования. Записанное
+        // преобразование совпадает с `transformation` (это часть ключа кэша), поэтому сдвиг
+        // `origin_delta` до преобразования сдвигает экранную рамку слоя на его образ.
+        let screen_delta = transformation.apply_vector(origin_delta);
         for operation in operations {
             match operation {
                 PaintOperation::StartLayer(template_bounds) => {
                     let mut bounds = *template_bounds;
-                    bounds.origin += origin_delta;
+                    bounds.origin += screen_delta;
                     let clipped_bounds = bounds.intersect(&content_mask.bounds);
                     if clipped_bounds.is_empty() {
                         self.layer_stack
@@ -418,11 +422,10 @@ impl Scene {
                     sprite.bounds.origin += origin_delta;
                     sprite.content_mask = content_mask.clone();
                     sprite.transformation = transformation;
-                    sprite.order = self
-                        .layer_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_else(|| self.primitive_bounds.insert(sprite.bounds));
+                    sprite.order = self.layer_stack.last().copied().unwrap_or_else(|| {
+                        self.primitive_bounds
+                            .insert(transformation.bounding_box(&sprite.bounds))
+                    });
                     self.monochrome_sprites.push(sprite);
                 }
                 PaintOperation::Primitive(Primitive::PolychromeSprite(template)) => {
@@ -430,11 +433,10 @@ impl Scene {
                     sprite.bounds.origin += origin_delta;
                     sprite.content_mask = content_mask.clone();
                     sprite.transformation = transformation;
-                    sprite.order = self
-                        .layer_stack
-                        .last()
-                        .copied()
-                        .unwrap_or_else(|| self.primitive_bounds.insert(sprite.bounds));
+                    sprite.order = self.layer_stack.last().copied().unwrap_or_else(|| {
+                        self.primitive_bounds
+                            .insert(transformation.bounding_box(&sprite.bounds))
+                    });
                     self.polychrome_sprites.push(sprite);
                 }
                 PaintOperation::Primitive(_) => {
@@ -1141,6 +1143,16 @@ impl TransformationMatrix {
         }
     }
 
+    /// Образ вектора `vector` при преобразовании: поворот и масштаб без переноса.
+    pub(crate) fn apply_vector(&self, vector: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        let x = vector.x.0;
+        let y = vector.y.0;
+        point(
+            ScaledPixels(self.rotation_scale[0][0] * x + self.rotation_scale[0][1] * y),
+            ScaledPixels(self.rotation_scale[1][0] * x + self.rotation_scale[1][1] * y),
+        )
+    }
+
     /// Охватывающая рамка `bounds` после преобразования, как его применяют шейдеры.
     pub(crate) fn bounding_box(&self, bounds: &Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
         if *self == Self::unit() {
@@ -1520,6 +1532,86 @@ mod tests {
         let orders: Vec<_> = scene.quads.iter().map(|quad| quad.order).collect();
         assert_eq!(orders[0], orders[1]);
         assert!(orders[2] > orders[0]);
+    }
+
+    fn test_sprite(
+        bounds: Bounds<ScaledPixels>,
+        transformation: TransformationMatrix,
+    ) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: window_mask_of(1000.),
+            color: Hsla::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation,
+        }
+    }
+
+    fn window_mask_of(side: f32) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: scaled_bounds(0., 0., side, side),
+        }
+    }
+
+    #[test]
+    fn replayed_cached_text_is_ordered_by_screen_bounds_after_transformation() {
+        // Текст масштабированного элемента, записанный так, как его пишет кадр: слой строки
+        // рамкой на экране, спрайты границами до преобразования.
+        let transformation = TransformationMatrix::unit().scale(Size::new(0.6, 0.6));
+        let glyph = scaled_bounds(500., 500., 40., 40.);
+        let mut recorded = Scene::default();
+        recorded.push_layer(transformation.bounding_box(&glyph));
+        recorded.insert_primitive(test_sprite(glyph, transformation));
+        recorded.pop_layer();
+        recorded.insert_primitive(test_sprite(glyph, transformation));
+        let operations = recorded.clone_text_paint(0..recorded.len()).unwrap();
+
+        // Тот же текст сдвинут на 100 px до преобразования: на экране глифы в 360..384 по x,
+        // поверх фона карточки. До преобразования они были бы в 600..640, вне фона.
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: scaled_bounds(0., 0., 1000., 1000.),
+            content_mask: window_mask_of(1000.),
+            ..Default::default()
+        });
+        let cover = scaled_bounds(355., 290., 30., 50.);
+        scene.insert_primitive(Quad {
+            bounds: cover,
+            content_mask: window_mask_of(1000.),
+            ..Default::default()
+        });
+        scene.replay_cached_text(
+            &operations,
+            scaled_point(100., 0.),
+            window_mask_of(1000.),
+            transformation,
+        );
+
+        let cover_order = scene.quads[1].order;
+        assert_eq!(scene.monochrome_sprites.len(), 2);
+        for sprite in &scene.monochrome_sprites {
+            assert!(
+                transformation
+                    .bounding_box(&sprite.bounds)
+                    .intersects(&cover),
+                "{sprite:?}"
+            );
+            assert!(
+                sprite.order > cover_order,
+                "{} <= {cover_order}",
+                sprite.order
+            );
+        }
     }
 
     #[test]

@@ -3161,12 +3161,17 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let content_mask = self.content_mask().scale(scale_factor);
+        // Порядок примитивов сцена считает по их рамкам на экране, после преобразования
+        // элемента, и маска задана там же. Рамка слоя до преобразования разошлась бы с
+        // ними: слой строки масштабированной карточки не пересёкся бы с её фоном в
+        // BoundsTree и рисовался бы под ним.
+        let clipped_bounds = self
+            .element_transform()
+            .bounding_box(&bounds.scale(scale_factor))
+            .intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
-            self.next_frame
-                .scene
-                .push_layer(clipped_bounds.scale(scale_factor));
+            self.next_frame.scene.push_layer(clipped_bounds);
         }
 
         let result = f(self);
@@ -5594,7 +5599,11 @@ pub fn outline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{self as gpui, TestAppContext, hsla};
+    use crate::{
+        self as gpui, AtlasTextureId, AtlasTextureKind, AtlasTile, BoxShadow, DevicePixels,
+        Drawable, IntoElement, MonochromeSprite, ParentElement, PrimitiveBatch, Styled,
+        TestAppContext, TileId, VisualTestContext, canvas, div, hsla, px,
+    };
 
     /// Перекрывающиеся слои цвета и треугольников, часть вершин которых лежит за маской.
     /// Координаты кратны четверти пикселя: на них `Bounds::union` в `push_triangle` не
@@ -5695,5 +5704,222 @@ mod tests {
             });
             assert!(paths.is_empty());
         });
+    }
+
+    /// Сторона тестового глифа в логических пикселях.
+    const TEST_GLYPH: f32 = 20.;
+
+    /// Рисует квадратный «глиф» `bounds` так же, как строка текста: монохромный спрайт с
+    /// текущими маской и преобразованием внутри `paint_layer` рамки строки. Тестовая
+    /// платформа не растеризует шрифты, поэтому спрайт вставляется напрямую.
+    fn paint_test_glyph(window: &mut Window, bounds: Bounds<Pixels>) {
+        window.paint_layer(bounds, |window| {
+            let scale_factor = window.scale_factor();
+            let sprite = MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds: bounds.scale(scale_factor),
+                content_mask: window.content_mask().scale(scale_factor),
+                color: crate::black(),
+                tile: AtlasTile {
+                    texture_id: AtlasTextureId {
+                        index: 0,
+                        kind: AtlasTextureKind::Monochrome,
+                    },
+                    tile_id: TileId(0),
+                    padding: 0,
+                    bounds: Bounds::new(
+                        point(DevicePixels(0), DevicePixels(0)),
+                        size(DevicePixels(40), DevicePixels(40)),
+                    ),
+                },
+                transformation: window.element_transform(),
+            };
+            window.next_frame.scene.insert_primitive(sprite);
+        });
+    }
+
+    /// Абсолютно размещённый тестовый глиф с левым верхним углом `(x, y)` в координатах
+    /// родителя до преобразования.
+    fn test_glyph(x: f32, y: f32) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(TEST_GLYPH))
+            .h(px(TEST_GLYPH))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    |bounds, (), window, _| paint_test_glyph(window, bounds),
+                )
+                .size_full(),
+            )
+    }
+
+    /// Раскладывает и рисует `root` в сцену следующего кадра, как кадр окна, и передаёт
+    /// готовую сцену в `inspect`.
+    fn inspect_painted_scene<R>(
+        cx: &mut VisualTestContext,
+        root: impl IntoElement,
+        inspect: impl FnOnce(&Scene) -> R,
+    ) -> R {
+        cx.update(|window, cx| {
+            window.next_frame.scene.clear();
+            let viewport = window.viewport_size();
+            let mut element = Drawable::new(root.into_any_element());
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            element.layout_as_root(viewport.into(), window, cx);
+            window.with_absolute_element_offset(Point::default(), |window| {
+                element.prepaint(window, cx)
+            });
+            window.invalidator.set_phase(DrawPhase::Paint);
+            element.paint(window, cx);
+            window.invalidator.set_phase(DrawPhase::None);
+            window.next_frame.scene.finish();
+            let result = inspect(&window.next_frame.scene);
+            window.next_frame.scene.clear();
+            result
+        })
+    }
+
+    /// Левые верхние углы (в логических пикселях до преобразования) глифов, которые
+    /// рисуются после квада с рамкой `cover`, то есть видны поверх него.
+    fn glyphs_drawn_over(scene: &Scene, cover: Bounds<ScaledPixels>) -> Vec<(f32, f32)> {
+        let mut cover_drawn = false;
+        let mut glyphs = Vec::new();
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Quads(quads) => {
+                    cover_drawn |= quads.iter().any(|quad| quad.bounds == cover);
+                }
+                PrimitiveBatch::MonochromeSprites { sprites, .. } if cover_drawn => {
+                    glyphs.extend(sprites.iter().map(|sprite| {
+                        (sprite.bounds.origin.x.0 / 2., sprite.bounds.origin.y.0 / 2.)
+                    }));
+                }
+                _ => {}
+            }
+        }
+        glyphs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        glyphs
+    }
+
+    /// Карточка Chora на масштабе камеры 0,6: внешний блок в размерах холста с `.scale(zoom)`
+    /// и обводкой тенью, внутри непрозрачное тело с `overflow_hidden` и текстом. Глифы в
+    /// нижней и правой частях лежат дальше 0,6 × экранного размера карточки от её края.
+    #[gpui::test]
+    fn glyphs_of_scaled_card_are_drawn_over_its_background(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let (left, top, width, height, zoom) = (100., 50., 560., 480., 0.6);
+        let glyphs = [(10., 10.), (10., 400.), (500., 10.), (500., 400.)];
+        // Нижний и правый глифы дальше экранного размера карточки от её края до
+        // преобразования, но внутри карточки на экране.
+        assert!(400. > height * zoom && 400. + TEST_GLYPH < height);
+        assert!(500. > width * zoom && 500. + TEST_GLYPH < width);
+
+        let body = glyphs.iter().fold(
+            div().size_full().overflow_hidden().bg(crate::white()),
+            |body, &(x, y)| body.child(test_glyph(x, y)),
+        );
+        let card = div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .w(px(width))
+            .h(px(height))
+            .scale(zoom)
+            .shadow(vec![BoxShadow {
+                color: crate::black(),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(1.),
+            }])
+            .child(body);
+        let root = div().size_full().bg(hsla(0., 0., 0.9, 1.)).child(card);
+
+        let card_bounds = Bounds::new(point(px(left), px(top)), size(px(width), px(height)));
+        let visible = inspect_painted_scene(cx, root, |scene| {
+            assert_eq!(scene.monochrome_sprites.len(), glyphs.len());
+            glyphs_drawn_over(scene, card_bounds.scale(2.))
+        });
+        let expected: Vec<_> = glyphs.iter().map(|&(x, y)| (left + x, top + y)).collect();
+        assert_eq!(visible, expected);
+    }
+
+    /// Отсечение по маске окна идёт по рамке глифа на экране: глиф, частично заходящий за
+    /// край, остаётся целиком (дорезает шейдер попиксельно), глиф целиком за краем
+    /// отбрасывается, даже если до преобразования он внутри окна, и наоборот.
+    #[gpui::test]
+    fn scaled_glyphs_are_clipped_by_screen_bounds_at_viewport_edges(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let viewport = cx.update(|window, _| window.viewport_size());
+        let zoom = 0.6;
+        let glyph = zoom * TEST_GLYPH;
+        let right_left = f32::from(viewport.width) - 220.;
+        let left_left = -400.;
+        let bottom_top = f32::from(viewport.height) - 220.;
+        // Смещения глифов внутри масштабированного блока до преобразования.
+        let right_inside = 300.; // до преобразования за окном, на экране внутри
+        let right_partial = 360.; // на экране заходит за правый край
+        let right_outside = 400.; // на экране целиком за правым краем
+        let left_outside = 500.; // до преобразования в окне, на экране левее него
+        let left_partial = 660.; // на экране заходит за левый край
+        let bottom_partial = 360.; // на экране заходит за нижний край
+        let screen_x = |left: f32, offset: f32| left + zoom * offset;
+        assert!(right_left + right_inside > f32::from(viewport.width));
+        assert!(screen_x(right_left, right_inside) + glyph < f32::from(viewport.width));
+        assert!(screen_x(right_left, right_partial) < f32::from(viewport.width));
+        assert!(screen_x(right_left, right_partial) + glyph > f32::from(viewport.width));
+        assert!(screen_x(right_left, right_outside) > f32::from(viewport.width));
+        assert!(left_left + left_outside > 0.);
+        assert!(screen_x(left_left, left_outside) + glyph < 0.);
+        assert!(screen_x(left_left, left_partial) < 0.);
+        assert!(screen_x(left_left, left_partial) + glyph > 0.);
+        assert!(bottom_top + zoom * bottom_partial < f32::from(viewport.height));
+        assert!(bottom_top + zoom * bottom_partial + glyph > f32::from(viewport.height));
+
+        let scaled_block = |left: f32, top: f32, glyphs: &[(f32, f32)]| {
+            glyphs.iter().fold(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(800.))
+                    .h(px(400.))
+                    .scale(zoom),
+                |block, &(x, y)| block.child(test_glyph(x, y)),
+            )
+        };
+        let root = div()
+            .size_full()
+            .child(scaled_block(
+                right_left,
+                100.,
+                &[(right_inside, 0.), (right_partial, 0.), (right_outside, 0.)],
+            ))
+            .child(scaled_block(
+                left_left,
+                200.,
+                &[(left_outside, 0.), (left_partial, 0.)],
+            ))
+            .child(scaled_block(100., bottom_top, &[(0., bottom_partial)]));
+
+        let mut kept = inspect_painted_scene(cx, root, |scene| {
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| (sprite.bounds.origin.x.0 / 2., sprite.bounds.origin.y.0 / 2.))
+                .collect::<Vec<_>>()
+        });
+        kept.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut expected = vec![
+            (right_left + right_inside, 100.),
+            (right_left + right_partial, 100.),
+            (left_left + left_partial, 200.),
+            (100., bottom_top + bottom_partial),
+        ];
+        expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(kept, expected);
     }
 }

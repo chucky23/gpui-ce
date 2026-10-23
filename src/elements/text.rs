@@ -2,8 +2,9 @@ use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScaledPixels, SharedString, Size,
-    TextOverflow, TextRun, TextStyle, TextStyleRefinement, TooltipId, WhiteSpace, Window,
-    WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    TextOverflow, TextRun, TextStyle, TextStyleRefinement, TooltipId, TransformationMatrix,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use smallvec::SmallVec;
@@ -365,6 +366,9 @@ struct RasterTextPaintCacheEntry {
     element_opacity_bits: u32,
     bounds_size: Size<Pixels>,
     content_mask_bounds: Bounds<ScaledPixels>,
+    // Записанные рамки слоёв лежат на экране после преобразования элемента; повторять их
+    // можно только с тем же преобразованием.
+    transformation: TransformationMatrix,
     source_origin: Point<ScaledPixels>,
     operations: Vec<crate::scene::PaintOperation>,
 }
@@ -571,6 +575,7 @@ impl TextLayout {
         let scaled_origin = bounds.origin.scale(scale_factor);
         let content_mask_bounds = window.content_mask().scale(scale_factor).bounds;
         let element_opacity = window.element_opacity();
+        let transformation = window.element_transform();
         let same_subpixel_phase = |left: Point<ScaledPixels>, right: Point<ScaledPixels>| {
             let phase = |value: ScaledPixels| value.0.rem_euclid(1.0);
             (phase(left.x) - phase(right.x)).abs() < f32::EPSILON
@@ -586,6 +591,7 @@ impl TextLayout {
                     // operation captured for another tile would therefore carry only the
                     // first tile's text fragment into the new tile.
                     && entry.content_mask_bounds == content_mask_bounds
+                    && entry.transformation == transformation
                     && same_subpixel_phase(entry.source_origin, scaled_origin)
             })
         {
@@ -593,7 +599,7 @@ impl TextLayout {
                 &entry.operations,
                 scaled_origin - entry.source_origin,
                 window.content_mask().scale(scale_factor),
-                window.element_transform(),
+                transformation,
             );
             return;
         }
@@ -642,6 +648,7 @@ impl TextLayout {
                     element_opacity_bits: element_opacity.to_bits(),
                     bounds_size: bounds.size,
                     content_mask_bounds,
+                    transformation,
                     source_origin: scaled_origin,
                     operations,
                 });
