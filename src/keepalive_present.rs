@@ -2,13 +2,19 @@
 //! дисплей не снижал частоту.
 //!
 //! При двух drawable корневого слоя такой повтор почти всегда ждёт в `nextDrawable`, пока
-//! прошлый показ не сменит кадр на экране, то есть 4–8 мс главного потока на каждом такте.
-//! Работа, которая строит новую сцену после действия пользователя, стоит за этим ожиданием.
-//! Режим задаёт переменная `GPUI_KEEPALIVE_PRESENT`:
+//! прошлый показ не сменит кадр на экране, то есть до 8 мс главного потока на такте 8,3 мс.
+//! Ввод, который AppKit ещё не передал окну, ждёт за этим повтором, и окно на этом такте не
+//! грязное. Когда главный поток занят без пауз, каждый следующий такт DisplayLink уже стоит в
+//! очереди к концу предыдущего, и порядок «такт, ввод» закрепляется: новая сцена строится через
+//! такт, а промежуточный уходит на ожидание drawable ради старой сцены (режим полу-частоты).
+//! Повтор, который ждал бы drawable, ничего не даёт дисплею: в очереди показа уже стоит кадр,
+//! и дисплей получит его на ближайшем обновлении. Поэтому по умолчанию такой повтор
+//! пропускается.
 //!
-//! * `block` или без переменной — прежнее поведение: повтор ждёт свободный drawable;
-//! * `nonblocking` — повтор пропускается, если свободного drawable сейчас нет. В очереди
-//!   показа тогда уже стоит кадр, и дисплей получит его на ближайшем обновлении.
+//! Переменная `GPUI_KEEPALIVE_PRESENT` оставлена для сравнения:
+//!
+//! * `nonblocking` или без переменной — повтор пропускается, если свободного drawable сейчас нет;
+//! * `block` — прежнее поведение: повтор ждёт свободный drawable.
 //!
 //! Режим касается только повтора ради удержания. Показ новой или ещё не показанной сцены и
 //! повтор кадра, отброшенного Metal, идут прежним путём.
@@ -19,10 +25,10 @@ pub(crate) const KEEPALIVE_PRESENT_ENV: &str = "GPUI_KEEPALIVE_PRESENT";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum KeepalivePresentMode {
-    /// Повтор ради удержания ждёт свободный drawable.
-    #[default]
+    /// Повтор ради удержания ждёт свободный drawable. Прежнее поведение, только для сравнения.
     Block,
     /// Повтор ради удержания пропускается, если показ ждал бы свободный drawable.
+    #[default]
     NonBlocking,
 }
 
@@ -32,15 +38,16 @@ impl KeepalivePresentMode {
             let value = std::env::var(KEEPALIVE_PRESENT_ENV).ok();
             match KeepalivePresentMode::parse(value.as_deref()) {
                 Ok(mode) => {
-                    if mode != KeepalivePresentMode::Block {
+                    if mode != KeepalivePresentMode::default() {
                         log::info!("keepalive present: {mode:?}");
                     }
                     mode
                 }
                 Err(error) => {
-                    // Опечатка не должна молча менять замер: режим прежний, причина в логе.
-                    log::error!("keepalive present mode reset to block: {error}");
-                    KeepalivePresentMode::Block
+                    // Опечатка не должна молча менять замер: режим по умолчанию, причина в логе.
+                    let mode = KeepalivePresentMode::default();
+                    log::error!("keepalive present mode reset to {mode:?}: {error}");
+                    mode
                 }
             }
         });
@@ -49,7 +56,8 @@ impl KeepalivePresentMode {
 
     pub(crate) fn parse(value: Option<&str>) -> Result<KeepalivePresentMode, String> {
         match value.map(str::trim).unwrap_or_default() {
-            "" | "block" => Ok(KeepalivePresentMode::Block),
+            "" => Ok(KeepalivePresentMode::default()),
+            "block" => Ok(KeepalivePresentMode::Block),
             "nonblocking" => Ok(KeepalivePresentMode::NonBlocking),
             other => Err(format!("{KEEPALIVE_PRESENT_ENV}: unknown mode {other:?}")),
         }
@@ -75,17 +83,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_or_block_keeps_previous_behavior() {
+    fn default_keepalive_never_waits_for_drawable() {
+        // Без переменной повтор старой сцены не должен занимать главный поток ожиданием
+        // drawable: иначе ввод ждёт за ним и новая сцена строится через такт.
+        for value in [None, Some(""), Some("  ")] {
+            let mode = KeepalivePresentMode::parse(value).unwrap();
+            assert_eq!(mode, KeepalivePresentMode::NonBlocking);
+            assert!(!mode.should_present(false, true, true));
+            assert!(mode.should_present(false, true, false));
+        }
         assert_eq!(
-            KeepalivePresentMode::parse(None),
-            Ok(KeepalivePresentMode::Block)
+            KeepalivePresentMode::default(),
+            KeepalivePresentMode::NonBlocking
         );
+    }
+
+    #[test]
+    fn block_keeps_previous_behavior_for_comparison() {
         assert_eq!(
             KeepalivePresentMode::parse(Some(" block ")),
-            Ok(KeepalivePresentMode::Block)
-        );
-        assert_eq!(
-            KeepalivePresentMode::parse(Some("")),
             Ok(KeepalivePresentMode::Block)
         );
         let mode = KeepalivePresentMode::Block;

@@ -465,8 +465,7 @@ impl Tiling {
 pub(crate) struct RequestFrameOptions {
     pub(crate) require_presentation: bool,
     /// Показ сейчас ждал бы свободный drawable: все, кроме кадра на экране, ещё в очереди показа.
-    /// Ставит только Metal на macOS. По нему `GPUI_KEEPALIVE_PRESENT=nonblocking` пропускает
-    /// повтор показа ради удержания частоты.
+    /// Ставит только Metal на macOS. По нему окно пропускает повтор показа ради удержания частоты.
     pub(crate) presentation_would_block: bool,
     /// Force refresh of all rendering states when true
     pub(crate) force_render: bool,

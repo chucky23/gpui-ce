@@ -1151,7 +1151,8 @@ impl Window {
 
                 // Keep presenting the current scene for 1 extra second since the
                 // last input to prevent the display from underclocking the refresh rate.
-                // GPUI_KEEPALIVE_PRESENT=nonblocking не ждёт drawable ради такого повтора.
+                // Повтор, который ждал бы drawable, пропускается: иначе ввод ждёт за ним, и
+                // новая сцена строится через такт (GPUI_KEEPALIVE_PRESENT=block — прежнее).
                 let keepalive =
                     active.get() && last_input_timestamp.get().elapsed() < Duration::from_secs(1);
                 let needs_present = keepalive_present.should_present(
