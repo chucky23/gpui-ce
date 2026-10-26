@@ -20,7 +20,13 @@ pub(crate) const ASYNC_DRAWABLE_ENV: &str = "GPUI_ASYNC_DRAWABLE";
 
 pub(crate) fn async_drawable_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os(ASYNC_DRAWABLE_ENV).is_some_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| parse_async_drawable(std::env::var_os(ASYNC_DRAWABLE_ENV).as_deref()))
+}
+
+/// Режим включает только точное значение `1`: без переменной и при любом другом значении
+/// `nextDrawable` по-прежнему вызывает главный поток.
+fn parse_async_drawable(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value == "1")
 }
 
 /// Итог неблокирующей попытки взять drawable.
@@ -355,6 +361,16 @@ mod tests {
         source.wait_acquire_started();
         source.complete(Some(drawable));
         source.wait_ready_signal();
+    }
+
+    #[test]
+    fn async_drawable_is_enabled_only_by_exact_one() {
+        use std::ffi::OsStr;
+        assert!(!parse_async_drawable(None));
+        for value in ["", "0", "true", "yes", " 1", "1 ", "2"] {
+            assert!(!parse_async_drawable(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert!(parse_async_drawable(Some(OsStr::new("1"))));
     }
 
     #[test]

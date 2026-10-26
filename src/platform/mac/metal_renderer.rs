@@ -342,6 +342,19 @@ fn root_presentation_would_block(in_flight: u64, maximum_drawable_count: u64) ->
     in_flight >= maximum_drawable_count.saturating_sub(1).max(1)
 }
 
+/// Ждал бы показ drawable. `prefetched_drawable_ready` — состояние заранее взятого drawable при
+/// `GPUI_ASYNC_DRAWABLE=1` вне синхронного кадра, `None` — прежний путь: оценка по очереди.
+fn presentation_would_block(
+    prefetched_drawable_ready: Option<bool>,
+    in_flight: u64,
+    maximum_drawable_count: u64,
+) -> bool {
+    match prefetched_drawable_ready {
+        Some(ready) => !ready,
+        None => root_presentation_would_block(in_flight, maximum_drawable_count),
+    }
+}
+
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
 
@@ -1176,8 +1189,16 @@ impl MetalRenderer {
     /// Ждал бы показ сейчас свободный drawable корневого слоя: все, кроме кадра на экране, ещё в
     /// очереди показа. Обработчик показа приходит чуть позже освобождения drawable, поэтому
     /// ответ осторожный: «ждал бы» может длиться ещё доли миллисекунды после освобождения.
+    ///
+    /// При `GPUI_ASYNC_DRAWABLE=1` главный поток вне синхронных кадров не ждёт `nextDrawable`,
+    /// поэтому ответ — готов ли заранее взятый drawable, а не оценка по очереди показа. Иначе
+    /// запаздывающий обработчик показа пропускал бы повтор, для которого drawable уже в руках.
     pub fn root_presentation_would_block(&self) -> bool {
-        root_presentation_would_block(
+        let prefetched_drawable_ready = (self.drawable_prefetcher.is_some()
+            && !self.presents_with_transaction)
+            .then(|| self.root_drawable_ready_for_frame());
+        presentation_would_block(
+            prefetched_drawable_ready,
             self.root_presentation_queue.in_flight(),
             self.layer.maximum_drawable_count(),
         )
@@ -3693,6 +3714,25 @@ mod root_presentation_queue_tests {
         assert_eq!(queue.in_flight(), 0);
         queue.submit();
         assert_eq!(queue.in_flight(), 1);
+    }
+
+    #[test]
+    fn without_async_drawable_would_block_is_the_queue_estimate() {
+        for in_flight in 0..4 {
+            for count in 1..4 {
+                assert_eq!(
+                    presentation_would_block(None, in_flight, count),
+                    root_presentation_would_block(in_flight, count),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn with_async_drawable_would_block_follows_prefetched_drawable() {
+        // Drawable в руках: повтор не ждёт, даже если обработчик показа ещё не пришёл.
+        assert!(!presentation_would_block(Some(true), 1, 2));
+        assert!(presentation_would_block(Some(false), 0, 2));
     }
 
     #[test]
