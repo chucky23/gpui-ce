@@ -422,6 +422,11 @@ impl Drop for RasterCompositorLayer {
     }
 }
 
+/// Число буферов корневого слоя в обычных кадрах: два держат задержку показа в один кадр.
+const ROOT_DRAWABLE_COUNT: u64 = 2;
+/// Число буферов на время синхронного кадра, показанного транзакцией.
+const SYNC_FRAME_DRAWABLE_COUNT: u64 = 3;
+
 fn new_raster_compositor_layer(
     device: &metal::DeviceRef,
     root_layer: &metal::MetalLayerRef,
@@ -808,7 +813,7 @@ impl MetalRenderer {
         // Two drawables bound presentation latency to one queued frame. The previous third
         // drawable improved throughput only when GPU work approached the refresh budget, while
         // adding a full frame of latency to interactive surfaces with short GPU workloads.
-        layer.set_maximum_drawable_count(2);
+        layer.set_maximum_drawable_count(ROOT_DRAWABLE_COUNT);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
             let _: () = msg_send![&*layer, setNeedsDisplayOnBoundsChange: YES];
@@ -1251,6 +1256,16 @@ impl MetalRenderer {
         self.presents_with_transaction = presents_with_transaction;
         self.layer
             .set_presents_with_transaction(presents_with_transaction);
+        // Синхронный кадр (изменение размера, активация окна) показывается транзакцией и ждёт
+        // `nextDrawable` на главном потоке. При двух буферах оба заняты: предыдущий на экране,
+        // следующий ждёт ближайшего показа, и главный поток стоит до секунды. Третий буфер на
+        // время такого кадра снимает ожидание, а задержка ввода при изменении размера не важна.
+        let drawable_count = if presents_with_transaction {
+            SYNC_FRAME_DRAWABLE_COUNT
+        } else {
+            ROOT_DRAWABLE_COUNT
+        };
+        self.layer.set_maximum_drawable_count(drawable_count);
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
