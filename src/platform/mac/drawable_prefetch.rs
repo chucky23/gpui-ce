@@ -12,6 +12,7 @@ use std::{
     mem,
     sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
     thread,
+    time::{Duration, Instant},
 };
 
 /// Переменная окружения, управляющая заблаговременным получением drawable. По умолчанию
@@ -164,10 +165,18 @@ impl<D: Send + 'static> DrawablePrefetcher<D> {
         }
     }
 
-    /// Ждёт drawable, пригодный по `usable`. Нужен синхронным кадрам
-    /// (`presentsWithTransaction`), которые нельзя отложить. `None` — источник вернул пустой
-    /// результат.
-    pub(crate) fn take_blocking(&self, usable: impl Fn(&D) -> bool) -> Option<D> {
+    /// Ждёт drawable, пригодный по `usable`, не дольше `timeout`. Нужен синхронным кадрам
+    /// (`presentsWithTransaction`): они не ждут сигнала готовности, но и бесконечно ждать не
+    /// могут. Предыдущий drawable освобождается лишь после фиксации транзакции, которую держит
+    /// сам главный поток внутри синхронного кадра, и вспомогательный поток стоит в `nextDrawable`
+    /// до секунды. По истечении срока ответ `NotReady`: показ откладывается и повторяется по
+    /// сигналу готовности. Пустой результат источника даёт `Unavailable`.
+    pub(crate) fn take_blocking(
+        &self,
+        usable: impl Fn(&D) -> bool,
+        timeout: Duration,
+    ) -> DrawableTake<D> {
+        let deadline = Instant::now() + timeout;
         let mut state = self.shared.lock();
         loop {
             match state.ready.take() {
@@ -175,7 +184,7 @@ impl<D: Send + 'static> DrawablePrefetcher<D> {
                     state.request_acquire();
                     drop(state);
                     self.shared.changed.notify_all();
-                    return Some(drawable);
+                    return DrawableTake::Ready(drawable);
                 }
                 Some(stale) => {
                     state.request_acquire();
@@ -189,7 +198,14 @@ impl<D: Send + 'static> DrawablePrefetcher<D> {
             }
             if mem::take(&mut state.last_acquire_failed) {
                 state.blocking_waiting = false;
-                return None;
+                return DrawableTake::Unavailable;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.blocking_waiting = false;
+                state.request_acquire();
+                state.presentation_waiting = true;
+                return DrawableTake::NotReady;
             }
             state.request_acquire();
             state.blocking_waiting = true;
@@ -197,8 +213,9 @@ impl<D: Send + 'static> DrawablePrefetcher<D> {
             state = self
                 .shared
                 .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
             state.blocking_waiting = false;
         }
     }
@@ -511,22 +528,46 @@ mod tests {
         prime(&prefetcher, &source, 1);
 
         thread::scope(|scope| {
-            let taken = scope.spawn(|| prefetcher.take_blocking(|drawable| *drawable == 2));
+            let taken = scope.spawn(|| {
+                prefetcher.take_blocking(|drawable| *drawable == 2, Duration::from_secs(5))
+            });
             source.wait_acquire_started();
             source.complete(Some(2));
-            assert_eq!(taken.join().expect("blocking take thread"), Some(2));
+            assert_eq!(
+                taken.join().expect("blocking take thread"),
+                DrawableTake::Ready(2)
+            );
         });
         source.assert_no_ready_signal();
+    }
+
+    #[test]
+    fn blocking_take_gives_up_after_timeout_and_signals_when_ready() {
+        let (prefetcher, source) = scripted_prefetcher();
+        let started = Instant::now();
+        // Источник не отвечает: так стоит `nextDrawable`, пока предыдущий drawable ждёт транзакции.
+        assert_eq!(
+            prefetcher.take_blocking(|_| true, Duration::from_millis(30)),
+            DrawableTake::NotReady
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        source.wait_acquire_started();
+        source.complete(Some(7));
+        source.wait_ready_signal();
+        assert_eq!(prefetcher.try_take(|_| true), DrawableTake::Ready(7));
     }
 
     #[test]
     fn blocking_take_reports_failed_acquisition() {
         let (prefetcher, source) = scripted_prefetcher();
         thread::scope(|scope| {
-            let taken = scope.spawn(|| prefetcher.take_blocking(|_| true));
+            let taken = scope.spawn(|| prefetcher.take_blocking(|_| true, Duration::from_secs(5)));
             source.wait_acquire_started();
             source.complete(None);
-            assert_eq!(taken.join().expect("blocking take thread"), None);
+            assert_eq!(
+                taken.join().expect("blocking take thread"),
+                DrawableTake::Unavailable
+            );
         });
     }
 
