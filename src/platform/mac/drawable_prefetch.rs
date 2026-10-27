@@ -14,8 +14,8 @@ use std::{
     thread,
 };
 
-/// Переменная окружения, включающая заблаговременное получение drawable. По умолчанию
-/// выключено: одна сборка меряется в обоих режимах.
+/// Переменная окружения, управляющая заблаговременным получением drawable. По умолчанию
+/// включено; значение `0` возвращает прежний путь, чтобы одна сборка мерилась в обоих режимах.
 pub(crate) const ASYNC_DRAWABLE_ENV: &str = "GPUI_ASYNC_DRAWABLE";
 
 pub(crate) fn async_drawable_enabled() -> bool {
@@ -23,10 +23,10 @@ pub(crate) fn async_drawable_enabled() -> bool {
     *ENABLED.get_or_init(|| parse_async_drawable(std::env::var_os(ASYNC_DRAWABLE_ENV).as_deref()))
 }
 
-/// Режим включает только точное значение `1`: без переменной и при любом другом значении
-/// `nextDrawable` по-прежнему вызывает главный поток.
+/// Режим выключает только точное значение `0`: без переменной и при любом другом значении
+/// drawable берётся заранее вспомогательным потоком.
 fn parse_async_drawable(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| value == "1")
+    value.is_none_or(|value| value != "0")
 }
 
 /// Итог неблокирующей попытки взять drawable.
@@ -364,13 +364,13 @@ mod tests {
     }
 
     #[test]
-    fn async_drawable_is_enabled_only_by_exact_one() {
+    fn async_drawable_is_disabled_only_by_exact_zero() {
         use std::ffi::OsStr;
-        assert!(!parse_async_drawable(None));
-        for value in ["", "0", "true", "yes", " 1", "1 ", "2"] {
-            assert!(!parse_async_drawable(Some(OsStr::new(value))), "{value:?}");
+        assert!(parse_async_drawable(None));
+        for value in ["", "1", "true", "no", " 0", "0 ", "2"] {
+            assert!(parse_async_drawable(Some(OsStr::new(value))), "{value:?}");
         }
-        assert!(parse_async_drawable(Some(OsStr::new("1"))));
+        assert!(!parse_async_drawable(Some(OsStr::new("0"))));
     }
 
     #[test]

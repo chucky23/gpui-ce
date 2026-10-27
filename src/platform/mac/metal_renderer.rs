@@ -343,7 +343,7 @@ fn root_presentation_would_block(in_flight: u64, maximum_drawable_count: u64) ->
 }
 
 /// Ждал бы показ drawable. `prefetched_drawable_ready` — состояние заранее взятого drawable при
-/// `GPUI_ASYNC_DRAWABLE=1` вне синхронного кадра, `None` — прежний путь: оценка по очереди.
+/// заблаговременном drawable (по умолчанию) вне синхронного кадра, `None` — прежний путь: оценка по очереди.
 fn presentation_would_block(
     prefetched_drawable_ready: Option<bool>,
     in_flight: u64,
@@ -704,7 +704,7 @@ pub(crate) struct MetalRenderer {
     device: metal::Device,
     layer: metal::MetalLayer,
     presents_with_transaction: bool,
-    /// Заранее взятые drawable основного слоя (`GPUI_ASYNC_DRAWABLE=1`). `None` — прежний
+    /// Заранее взятые drawable основного слоя (по умолчанию; `GPUI_ASYNC_DRAWABLE=0` отключает). `None` — прежний
     /// режим: `nextDrawable` блокирует главный поток.
     drawable_prefetcher: Option<DrawablePrefetcher<metal::MetalDrawable>>,
     /// Показ отложен, потому что drawable не был готов. Сцена остаётся в окне, показ
@@ -1190,7 +1190,7 @@ impl MetalRenderer {
     /// очереди показа. Обработчик показа приходит чуть позже освобождения drawable, поэтому
     /// ответ осторожный: «ждал бы» может длиться ещё доли миллисекунды после освобождения.
     ///
-    /// При `GPUI_ASYNC_DRAWABLE=1` главный поток вне синхронных кадров не ждёт `nextDrawable`,
+    /// Когда drawable берётся заранее (по умолчанию), главный поток вне синхронных кадров не ждёт `nextDrawable`,
     /// поэтому ответ — готов ли заранее взятый drawable, а не оценка по очереди показа. Иначе
     /// запаздывающий обработчик показа пропускал бы повтор, для которого drawable уже в руках.
     pub fn root_presentation_would_block(&self) -> bool {
@@ -1204,7 +1204,7 @@ impl MetalRenderer {
         )
     }
 
-    /// Включает заблаговременное получение drawable, если задано `GPUI_ASYNC_DRAWABLE=1`.
+    /// Включает заблаговременное получение drawable, если не задано `GPUI_ASYNC_DRAWABLE=0`.
     /// `notify_ready` вызывается из вспомогательного потока, когда отложенный показ можно
     /// повторить, и должен запросить кадр на главном потоке.
     pub fn start_drawable_prefetch(&mut self, notify_ready: impl Fn() + Send + 'static) {
@@ -1222,7 +1222,7 @@ impl MetalRenderer {
         }
     }
 
-    /// Можно ли строить кадр на этом такте. В режиме `GPUI_ASYNC_DRAWABLE=1` без готового
+    /// Можно ли строить кадр на этом такте. В режиме заранее взятого drawable (по умолчанию) без готового
     /// drawable корневого слоя ответ «нет»: кадр, собранный сейчас, ушёл бы в пропуск и был бы
     /// вытеснен. Тогда drawable запрашивается, и сигнал готовности запросит кадр снова. В прежнем
     /// режиме и для синхронных кадров ответ всегда «да».
